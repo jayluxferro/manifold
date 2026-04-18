@@ -90,6 +90,7 @@ def _parse_service(raw: dict) -> ServiceConfig:
         config_file=raw.get("config_file"),
         upstream_key=raw.get("upstream_key"),
         upstream_via=upstream_via,
+        upstream_path=raw.get("upstream_path", ""),
         enabled=raw.get("enabled", True),
     )
 

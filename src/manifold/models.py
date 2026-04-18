@@ -36,6 +36,7 @@ class ServiceConfig:
     config_file: str | None = None
     upstream_key: str | None = None
     upstream_via: UpstreamVia = UpstreamVia.CONFIG_FILE
+    upstream_path: str = ""
     enabled: bool = True
 
 

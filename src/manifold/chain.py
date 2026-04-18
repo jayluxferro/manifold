@@ -63,7 +63,8 @@ def compute_upstreams(
     for i, svc in enumerate(enabled):
         if i + 1 < len(enabled):
             next_svc = enabled[i + 1]
-            upstreams[svc.name] = f"http://127.0.0.1:{next_svc.port}"
+            base = f"http://127.0.0.1:{next_svc.port}"
+            upstreams[svc.name] = f"{base}{svc.upstream_path}" if svc.upstream_path else base
         else:
             upstreams[svc.name] = fallback_upstream
     return upstreams

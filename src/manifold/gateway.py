@@ -45,6 +45,14 @@ async def _proxy(request: Request) -> Response:
     headers.pop("host", None)
     headers.pop("transfer-encoding", None)
 
+    # Normalize auth: if client sends Authorization Bearer but not x-api-key,
+    # extract the token and set x-api-key so downstream services and the
+    # Anthropic API (which only checks x-api-key) can authenticate.
+    if "x-api-key" not in headers:
+        auth = headers.get("authorization", "")
+        if auth.lower().startswith("bearer "):
+            headers["x-api-key"] = auth[7:]
+
     body = await request.body()
 
     log.debug("Proxying %s %s → %s", request.method, request.url.path, url)
