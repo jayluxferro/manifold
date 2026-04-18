@@ -1,0 +1,15 @@
+# Minimal config — just one service for testing
+
+gateway:
+  host: 127.0.0.1
+  port: 9000
+
+pipeline:
+  - name: hivemind
+    directory: /Users/jay/dev/ml/mcp/hivemind
+    command: "uv run hivemind proxy --port {port} --upstream {upstream}"
+    port: 8765
+    health: /_health
+    stats: /_stats
+    upstream_via: cli_arg
+    enabled: true

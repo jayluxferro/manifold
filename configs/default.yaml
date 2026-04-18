@@ -1,0 +1,41 @@
+# Manifold pipeline configuration
+# Copy to ./manifold.yaml and edit paths to match your setup
+
+gateway:
+  host: 127.0.0.1
+  port: 9000
+
+pipeline:
+  # Privacy: scrub PII/secrets before cloud, restore in responses
+  - name: llm-redactor
+    directory: /Users/jay/dev/ml/mcp/llm-redactor
+    command: "uv run llm-redactor serve --port {port}"
+    port: 7789
+    health: /v1/redactor/config
+    stats: /v1/redactor/stats
+    config_file: llm_redactor.yaml
+    upstream_key: cloud_target.endpoint
+    upstream_via: config_file
+    enabled: true
+
+  # Optimization: route trivial requests locally, compress context, cache
+  - name: local-splitter
+    directory: /Users/jay/dev/ml/mcp/local-splitter
+    command: "uv run local-splitter serve-http --config config.yaml --port {port}"
+    port: 7788
+    health: /healthz
+    stats: /v1/splitter/stats
+    config_file: config.yaml
+    upstream_key: models.cloud.endpoint
+    upstream_via: config_file
+    enabled: true
+
+  # Scheduling: admission control, rate limiting, backpressure, budgets
+  - name: hivemind
+    directory: /Users/jay/dev/ml/mcp/hivemind
+    command: "uv run hivemind proxy --port {port} --upstream {upstream}"
+    port: 8765
+    health: /_health
+    stats: /_stats
+    upstream_via: cli_arg
+    enabled: true
