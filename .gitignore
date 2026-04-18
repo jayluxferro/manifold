@@ -24,7 +24,7 @@ uv.lock
 htmlcov/
 
 # Manifold runtime
-mainfold.yaml
+manifold.yaml
 .manifold/
 
 # Resilient-write internal
