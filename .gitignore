@@ -25,6 +25,7 @@ htmlcov/
 
 # Manifold runtime
 manifold.yaml
+manifold-*.yaml
 .manifold/
 
 # Resilient-write internal
