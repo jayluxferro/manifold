@@ -20,7 +20,6 @@ class ServiceStatus(enum.Enum):
     STARTING = "starting"
     HEALTHY = "healthy"
     UNHEALTHY = "unhealthy"
-    BYPASSED = "bypassed"
 
 
 @dataclass
@@ -77,11 +76,12 @@ class PipelineState:
 
     @property
     def active_services(self) -> list[ServiceState]:
-        """Services that are enabled and not bypassed."""
+        """Services that are enabled and currently healthy or starting."""
         return [
             s
             for s in self.services
-            if s.config.enabled and s.status != ServiceStatus.BYPASSED
+            if s.config.enabled
+            and s.status not in (ServiceStatus.STOPPED, ServiceStatus.UNHEALTHY)
         ]
 
     @property

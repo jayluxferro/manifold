@@ -17,6 +17,9 @@ from manifold.models import (
     UpstreamVia,
 )
 
+# Statuses that indicate a service should not receive traffic
+_SKIP_STATUSES = frozenset({ServiceStatus.STOPPED, ServiceStatus.UNHEALTHY})
+
 log = logging.getLogger(__name__)
 
 
@@ -82,8 +85,7 @@ def compute_active_upstreams(
     active = [
         s.config
         for s in pipeline.services
-        if s.config.enabled
-        and s.status not in (ServiceStatus.BYPASSED, ServiceStatus.STOPPED)
+        if s.config.enabled and s.status not in _SKIP_STATUSES
     ]
     return compute_upstreams(active, fallback_upstream)
 

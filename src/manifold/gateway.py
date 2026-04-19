@@ -53,7 +53,8 @@ async def _proxy(request: Request) -> Response:
         if auth.lower().startswith("bearer "):
             headers["x-api-key"] = auth[7:]
 
-    body = await request.body()
+    # Stream the request body to avoid buffering large payloads in memory
+    body = request.stream()
 
     log.debug("Proxying %s %s → %s", request.method, request.url.path, url)
 

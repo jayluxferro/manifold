@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
+from collections.abc import Callable
 
 from manifold.chain import resolve_command
 from manifold.logs import setup_service_log
@@ -14,6 +16,15 @@ log = logging.getLogger(__name__)
 
 # Tracks running subprocesses keyed by service name
 _processes: dict[str, asyncio.subprocess.Process] = {}
+
+# Optional callback invoked when a service crashes (set by orchestrator)
+_on_crash: Callable[[ServiceState], None] | None = None
+
+
+def set_on_crash(callback: Callable[[ServiceState], None] | None) -> None:
+    """Register a callback to be invoked when a service crashes unexpectedly."""
+    global _on_crash
+    _on_crash = callback
 
 
 async def start_service(
@@ -33,6 +44,7 @@ async def start_service(
         cwd=svc.directory,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,  # create process group so we can kill children
     )
     _processes[svc.name] = proc
     state.pid = proc.pid
@@ -73,11 +85,16 @@ async def _watch_exit(state: ServiceState, proc: asyncio.subprocess.Process) -> 
         log.warning("%s exited with code %s", name, code)
         state.status = ServiceStatus.UNHEALTHY
         state.pid = None
+        if _on_crash is not None:
+            try:
+                _on_crash(state)
+            except Exception:
+                log.exception("on_crash callback failed for %s", name)
     _processes.pop(name, None)
 
 
 async def stop_service(state: ServiceState) -> None:
-    """Gracefully stop a service subprocess."""
+    """Gracefully stop a service subprocess and its entire process group."""
     name = state.config.name
     proc = _processes.get(name)
     if proc is None:
@@ -89,15 +106,21 @@ async def stop_service(state: ServiceState) -> None:
     state.status = ServiceStatus.STOPPED
 
     try:
-        proc.terminate()
+        # Kill the entire process group (shell + children) rather than
+        # just the shell process, which would leave children as zombies.
+        pgid = os.getpgid(proc.pid)
+        os.killpg(pgid, signal.SIGTERM)
         try:
             await asyncio.wait_for(proc.wait(), timeout=5.0)
         except asyncio.TimeoutError:
-            log.warning("%s did not stop gracefully, killing", name)
-            proc.kill()
+            log.warning("%s did not stop gracefully, killing process group", name)
+            os.killpg(pgid, signal.SIGKILL)
             await proc.wait()
     except ProcessLookupError:
         pass
+    except OSError as exc:
+        # Fallback: process group may already be gone
+        log.debug("OS error stopping %s: %s", name, exc)
 
     state.pid = None
     _processes.pop(name, None)

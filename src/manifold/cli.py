@@ -26,7 +26,7 @@ from manifold.gateway import create_app
 from manifold.health import health_loop
 from manifold.watcher import watch_config
 from manifold.models import PipelineState, ServiceState, ServiceStatus, UpstreamVia
-from manifold.process import start_service, stop_all
+from manifold.process import set_on_crash, start_service, stop_all
 from manifold.stats import aggregate_stats
 
 app = typer.Typer(
@@ -65,6 +65,15 @@ async def _run_pipeline(config_path: str | None, verbose: bool) -> None:
     pipeline = PipelineState(
         services=[ServiceState(config=svc) for svc in cfg.pipeline]
     )
+
+    # Register crash callback so chain rewires immediately on service exit
+    from manifold.chain import rewire_around
+
+    def _handle_crash(state: ServiceState) -> None:
+        log.warning("Service '%s' crashed — rewiring chain to bypass it", state.config.name)
+        rewire_around(pipeline, cfg.gateway)
+
+    set_on_crash(_handle_crash)
 
     # Wire chain: compute upstreams and patch config files
     upstreams = wire_pipeline(cfg.pipeline, cfg.gateway)
