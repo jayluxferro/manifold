@@ -67,6 +67,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:9000
 gateway:
   host: 127.0.0.1
   port: 9000
+  # Optional — wait for each enabled service's `health` URL before binding the gateway:
+  # startup_health_timeout: 120
+  # startup_health_poll_interval: 0.25
+  # startup_health_strict: false   # true → `manifold up` fails if services never become healthy
 
 pipeline:
   - name: llm-redactor
@@ -98,6 +102,10 @@ pipeline:
     upstream_via: cli_arg
     enabled: true
 ```
+
+After subprocesses start, Manifold **polls each enabled service’s health endpoint** (parallel HTTP GETs every `startup_health_poll_interval` seconds, up to `startup_health_timeout`). When every check returns 2xx, the gateway binds. If the deadline passes: by default a **warning** is logged and startup continues; with **`startup_health_strict: true`**, `manifold up` **exits with status 1** instead.
+
+On **Windows**, stopping a service uses `terminate`/`kill` on the top-level shell process; on **Linux/macOS** it uses **process groups** (`killpg`) so child processes created by the shell are included. Child processes that **fully detach** from the shell may keep running; for the same teardown guarantees as Unix, run Manifold under **WSL** or use a full process-tree stop (for example `taskkill /PID … /T` on the shell PID) outside Manifold.
 
 ### Pipeline Order
 
@@ -144,6 +152,20 @@ manifold add             # Interactively register a new service into the pipelin
 ### Options
 
 All commands accept `--config / -c` to specify a config file path (defaults to `./manifold.yaml`).
+
+## Development
+
+```bash
+uv sync --all-groups
+uv run pytest
+uv run ruff check src/manifold tests
+```
+
+Optional: install [pre-commit](https://pre-commit.com/) (`pip install pre-commit`, then `pre-commit install`) so **ruff check** and **ruff format** run on each commit — see `.pre-commit-config.yaml`. [Dependabot](https://docs.github.com/en/code-security/dependabot) opens PRs for **GitHub Actions** and **uv** dependencies (`.github/dependabot.yml`). To run **CI** without pushing, use **Actions → CI → Run workflow** (`workflow_dispatch`).
+
+CI runs **pytest** with **coverage** (XML uploaded as an artifact; `mcp_server.py` is omitted from the gate). The coverage gate is **`fail_under = 55`** in `pyproject.toml` — raise it as tests grow.
+
+**Releases:** push a semver tag matching `v*.*.*` (for example `git tag v0.1.1 && git push origin v0.1.1`). The **Release** workflow builds wheels/sdist with `uv build` and attaches them to a GitHub Release with auto-generated notes (`.github/workflows/release.yml`).
 
 ## Hot Reload
 

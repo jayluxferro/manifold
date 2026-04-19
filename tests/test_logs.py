@@ -3,7 +3,7 @@
 from pathlib import Path
 from unittest.mock import patch
 
-from manifold.logs import clear_logs, get_log_path, list_logs, setup_service_log, tail_log
+from manifold.logs import clear_logs, list_logs, setup_service_log, tail_log
 
 
 def test_setup_service_log(tmp_path: Path):

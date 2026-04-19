@@ -1,0 +1,9 @@
+# Install: `pip install pre-commit` then `pre-commit install`
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.11
+    hooks:
+      - id: ruff
+        files: ^(src/manifold|tests)/.*\.py$
+      - id: ruff-format
+        files: ^(src/manifold|tests)/.*\.py$

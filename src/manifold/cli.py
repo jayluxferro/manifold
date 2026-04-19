@@ -7,7 +7,6 @@ import json
 import logging
 import os
 import signal
-import sys
 from pathlib import Path
 
 import httpx
@@ -18,15 +17,24 @@ import yaml
 from manifold.chain import (
     compute_upstreams,
     get_entry_url,
-    patch_service_config,
     wire_pipeline,
 )
 from manifold.config import ConfigError, find_config, load_config
+from manifold import paths
 from manifold.gateway import create_app
-from manifold.health import health_loop
+from manifold.health import (
+    health_loop,
+    wait_for_services_ready,
+    StartupHealthTimeoutError,
+)
 from manifold.watcher import watch_config
-from manifold.models import PipelineState, ServiceState, ServiceStatus, UpstreamVia
-from manifold.process import set_on_crash, start_service, stop_all
+from manifold.models import PipelineState, ServiceState
+from manifold.process import (
+    set_on_crash,
+    start_service,
+    stop_all,
+    sync_kill_tracked_subprocesses,
+)
 from manifold.stats import aggregate_stats
 
 app = typer.Typer(
@@ -37,9 +45,46 @@ app = typer.Typer(
 
 log = logging.getLogger("manifold")
 
-PID_DIR = Path.home() / ".manifold"
-PID_FILE = PID_DIR / "manifold.pid"
-PORT_FILE = PID_DIR / "manifold.port"
+
+def _maybe_prompt_gateway_startup_health(raw: dict) -> None:
+    """Optionally merge gateway.startup_health_* keys into *raw* (mutates in place)."""
+    if not typer.confirm("Configure gateway startup health options?", default=False):
+        return
+
+    gwy = raw.get("gateway")
+    if not isinstance(gwy, dict):
+        gwy = {}
+        raw["gateway"] = gwy
+
+    while True:
+        timeout = typer.prompt(
+            "startup_health_timeout (seconds)",
+            default=int(gwy.get("startup_health_timeout", 120)),
+            type=int,
+        )
+        poll = typer.prompt(
+            "startup_health_poll_interval (seconds)",
+            default=float(gwy.get("startup_health_poll_interval", 0.25)),
+            type=float,
+        )
+        if timeout <= 0 or poll <= 0:
+            typer.echo(
+                "Values must be positive — not saving startup health options.", err=True
+            )
+            return
+        if poll > timeout:
+            typer.echo(
+                "startup_health_poll_interval must be <= startup_health_timeout — try again."
+            )
+            continue
+        strict = typer.confirm(
+            "startup_health_strict (fail `manifold up` if services never become healthy)?",
+            default=bool(gwy.get("startup_health_strict", False)),
+        )
+        gwy["startup_health_timeout"] = timeout
+        gwy["startup_health_poll_interval"] = poll
+        gwy["startup_health_strict"] = strict
+        break
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -70,7 +115,9 @@ async def _run_pipeline(config_path: str | None, verbose: bool) -> None:
     from manifold.chain import rewire_around
 
     def _handle_crash(state: ServiceState) -> None:
-        log.warning("Service '%s' crashed — rewiring chain to bypass it", state.config.name)
+        log.warning(
+            "Service '%s' crashed — rewiring chain to bypass it", state.config.name
+        )
         rewire_around(pipeline, cfg.gateway)
 
     set_on_crash(_handle_crash)
@@ -86,9 +133,11 @@ async def _run_pipeline(config_path: str | None, verbose: bool) -> None:
         upstream_url = upstreams[state.config.name]
         await start_service(state, upstream_url)
 
-    # Wait briefly for services to initialize
-    log.info("Waiting for services to start...")
-    await asyncio.sleep(2.0)
+    try:
+        await wait_for_services_ready(pipeline, cfg.gateway)
+    except StartupHealthTimeoutError as exc:
+        log.error("%s", exc)
+        raise typer.Exit(1)
 
     # Health check stop event
     stop_event = asyncio.Event()
@@ -131,9 +180,9 @@ async def _run_pipeline(config_path: str | None, verbose: bool) -> None:
     pipeline.gateway_running = True
 
     # Write PID + port files for `manifold down` / `manifold stats`
-    PID_DIR.mkdir(parents=True, exist_ok=True)
-    PID_FILE.write_text(str(os.getpid()))
-    PORT_FILE.write_text(f"{cfg.gateway.host}:{cfg.gateway.port}")
+    paths.PID_DIR.mkdir(parents=True, exist_ok=True)
+    paths.atomic_write_text(paths.PID_FILE, str(os.getpid()))
+    paths.atomic_write_text(paths.PORT_FILE, f"{cfg.gateway.host}:{cfg.gateway.port}")
 
     log.info(
         "Manifold gateway listening on %s:%d",
@@ -157,15 +206,23 @@ async def _run_pipeline(config_path: str | None, verbose: bool) -> None:
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
-        log.info("Shutting down...")
         stop_event.set()
         health_task.cancel()
         watcher_task.cancel()
-        await stop_all(pipeline.services)
-        pipeline.gateway_running = False
-        PID_FILE.unlink(missing_ok=True)
-        PORT_FILE.unlink(missing_ok=True)
-        log.info("Manifold stopped.")
+        await asyncio.gather(health_task, watcher_task, return_exceptions=True)
+        # The gateway lifespan may have already stopped services during
+        # uvicorn shutdown.  Only run teardown if it hasn't happened yet.
+        if pipeline.gateway_running:
+            log.info("Shutting down...")
+            try:
+                await stop_all(pipeline.services)
+            except Exception:
+                log.exception("Error stopping pipeline services")
+            sync_kill_tracked_subprocesses()
+            pipeline.gateway_running = False
+            paths.PID_FILE.unlink(missing_ok=True)
+            paths.PORT_FILE.unlink(missing_ok=True)
+            log.info("Manifold stopped.")
 
 
 @app.command()
@@ -222,26 +279,26 @@ def validate(
 
 def _read_gateway_address() -> str | None:
     """Read the gateway address from the port file."""
-    if PORT_FILE.exists():
-        return PORT_FILE.read_text().strip()
+    if paths.PORT_FILE.exists():
+        return paths.PORT_FILE.read_text().strip()
     return None
 
 
 @app.command()
 def down() -> None:
     """Stop a running manifold instance."""
-    if not PID_FILE.exists():
+    if not paths.PID_FILE.exists():
         typer.echo("No running manifold instance found.", err=True)
         raise typer.Exit(1)
 
-    pid = int(PID_FILE.read_text().strip())
+    pid = int(paths.PID_FILE.read_text().strip())
     try:
         os.kill(pid, signal.SIGTERM)
         typer.echo(f"Sent SIGTERM to manifold (pid={pid})")
     except ProcessLookupError:
         typer.echo(f"Process {pid} not found — cleaning up stale PID file.")
-        PID_FILE.unlink(missing_ok=True)
-        PORT_FILE.unlink(missing_ok=True)
+        paths.PID_FILE.unlink(missing_ok=True)
+        paths.PORT_FILE.unlink(missing_ok=True)
     except PermissionError:
         typer.echo(f"Permission denied sending signal to pid={pid}", err=True)
         raise typer.Exit(1)
@@ -259,7 +316,9 @@ def stats(
             cfg = load_config(config)
             addr = f"{cfg.gateway.host}:{cfg.gateway.port}"
         except ConfigError:
-            typer.echo("No running manifold found and no config to read port from.", err=True)
+            typer.echo(
+                "No running manifold found and no config to read port from.", err=True
+            )
             raise typer.Exit(1)
 
     url = f"http://{addr}/_manifold/stats"
@@ -294,6 +353,7 @@ def add(
     health = typer.prompt("Health endpoint path (e.g. /healthz)")
     stats_ep = typer.prompt("Stats endpoint path (leave empty to skip)", default="")
     import click
+
     upstream_via = typer.prompt(
         "Upstream via",
         type=click.Choice(["config_file", "cli_arg"]),
@@ -330,6 +390,11 @@ def add(
         raw["pipeline"] = []
 
     raw["pipeline"].append(entry)
+
+    # Only prompt for startup health if not already configured
+    gwy = raw.get("gateway") or {}
+    if "startup_health_timeout" not in gwy:
+        _maybe_prompt_gateway_startup_health(raw)
 
     with open(config_path, "w") as f:
         yaml.safe_dump(raw, f, default_flow_style=False, sort_keys=False)

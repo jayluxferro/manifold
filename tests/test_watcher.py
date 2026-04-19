@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from manifold.config import load_config
-from manifold.models import GatewayConfig, PipelineState, ServiceState, ServiceStatus
+from manifold.models import PipelineState, ServiceState
 from manifold.watcher import watch_config
 
 
@@ -43,9 +43,13 @@ async def test_watcher_detects_change(config_file: Path):
     stop_event = asyncio.Event()
 
     # Start watcher with very short interval
-    with patch("manifold.watcher._apply_config_changes", new_callable=AsyncMock) as mock_apply:
+    with patch(
+        "manifold.watcher._apply_config_changes", new_callable=AsyncMock
+    ) as mock_apply:
         task = asyncio.create_task(
-            watch_config(config_file, pipeline, gateway, interval=0.1, stop_event=stop_event)
+            watch_config(
+                config_file, pipeline, gateway, interval=0.1, stop_event=stop_event
+            )
         )
 
         # Modify the config file
@@ -72,9 +76,13 @@ async def test_watcher_ignores_invalid_config(config_file: Path):
     gateway = cfg.gateway
     stop_event = asyncio.Event()
 
-    with patch("manifold.watcher._apply_config_changes", new_callable=AsyncMock) as mock_apply:
+    with patch(
+        "manifold.watcher._apply_config_changes", new_callable=AsyncMock
+    ) as mock_apply:
         task = asyncio.create_task(
-            watch_config(config_file, pipeline, gateway, interval=0.1, stop_event=stop_event)
+            watch_config(
+                config_file, pipeline, gateway, interval=0.1, stop_event=stop_event
+            )
         )
 
         # Write invalid YAML

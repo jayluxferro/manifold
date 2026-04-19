@@ -8,7 +8,7 @@ from pathlib import Path
 
 from manifold.chain import wire_pipeline, compute_upstreams
 from manifold.config import ConfigError, load_config
-from manifold.models import GatewayConfig, ManifoldConfig, PipelineState, ServiceState, ServiceStatus
+from manifold.models import GatewayConfig, ManifoldConfig, PipelineState, ServiceState
 from manifold.process import restart_service, start_service, stop_service
 
 log = logging.getLogger(__name__)

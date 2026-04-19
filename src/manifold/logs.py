@@ -19,6 +19,7 @@ def setup_service_log(name: str) -> logging.Logger:
 
     logger = logging.getLogger(f"manifold.service.{name}")
     logger.setLevel(logging.DEBUG)
+    logger.propagate = False  # file-only; console output handled by process module
 
     # Avoid duplicate handlers on restart
     if not any(isinstance(h, logging.FileHandler) for h in logger.handlers):
@@ -54,11 +55,13 @@ def list_logs() -> list[dict]:
         return []
     result = []
     for p in sorted(LOG_DIR.glob("*.log")):
-        result.append({
-            "service": p.stem,
-            "path": str(p),
-            "size_bytes": p.stat().st_size,
-        })
+        result.append(
+            {
+                "service": p.stem,
+                "path": str(p),
+                "size_bytes": p.stat().st_size,
+            }
+        )
     return result
 
 

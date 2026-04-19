@@ -10,6 +10,7 @@ from mcp.server.fastmcp import FastMCP
 
 from manifold.config import ConfigError, find_config, load_config
 from manifold.logs import list_logs, tail_log
+from manifold.paths import PORT_FILE
 
 log = logging.getLogger(__name__)
 
@@ -24,11 +25,8 @@ _DEFAULT_ADDR = "127.0.0.1:9000"
 
 def _gateway_addr() -> str:
     """Resolve the running gateway address."""
-    from pathlib import Path
-
-    port_file = Path.home() / ".manifold" / "manifold.port"
-    if port_file.exists():
-        return port_file.read_text().strip()
+    if PORT_FILE.exists():
+        return PORT_FILE.read_text().strip()
     return _DEFAULT_ADDR
 
 
@@ -88,13 +86,16 @@ def manifold_validate(config_path: str | None = None) -> str:
     try:
         cfg = load_config(config_path)
         enabled = [s.name for s in cfg.pipeline if s.enabled]
-        return json.dumps({
-            "valid": True,
-            "services": len(cfg.pipeline),
-            "enabled": len(enabled),
-            "chain": enabled,
-            "gateway": f"{cfg.gateway.host}:{cfg.gateway.port}",
-        }, indent=2)
+        return json.dumps(
+            {
+                "valid": True,
+                "services": len(cfg.pipeline),
+                "enabled": len(enabled),
+                "chain": enabled,
+                "gateway": f"{cfg.gateway.host}:{cfg.gateway.port}",
+            },
+            indent=2,
+        )
     except ConfigError as e:
         return json.dumps({"valid": False, "error": str(e)}, indent=2)
 
@@ -145,7 +146,9 @@ def _toggle_service(name: str, enabled: bool) -> str:
         yaml.safe_dump(raw, f, default_flow_style=False, sort_keys=False)
 
     action = "enabled" if enabled else "disabled"
-    return f"Service '{name}' {action} in {config_path}. Hot-reload will apply the change."
+    return (
+        f"Service '{name}' {action} in {config_path}. Hot-reload will apply the change."
+    )
 
 
 @mcp.tool()

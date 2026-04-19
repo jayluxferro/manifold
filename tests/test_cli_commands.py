@@ -1,7 +1,5 @@
 """Tests for CLI commands: down, stats, validate, add."""
 
-import json
-import os
 import textwrap
 from pathlib import Path
 from unittest.mock import patch
@@ -9,7 +7,7 @@ from unittest.mock import patch
 import pytest
 from typer.testing import CliRunner
 
-from manifold.cli import PID_DIR, PID_FILE, PORT_FILE, app
+from manifold.cli import app
 
 runner = CliRunner()
 
@@ -56,7 +54,7 @@ def test_status_shows_chain(config_file: Path):
 
 
 def test_down_no_pidfile(tmp_path: Path):
-    with patch("manifold.cli.PID_FILE", tmp_path / "no.pid"):
+    with patch("manifold.paths.PID_FILE", tmp_path / "no.pid"):
         result = runner.invoke(app, ["down"])
         assert result.exit_code == 1
         assert "No running" in result.output
@@ -66,8 +64,10 @@ def test_down_stale_pid(tmp_path: Path):
     pid_file = tmp_path / "manifold.pid"
     port_file = tmp_path / "manifold.port"
     pid_file.write_text("999999999")  # unlikely to exist
-    with patch("manifold.cli.PID_FILE", pid_file), \
-         patch("manifold.cli.PORT_FILE", port_file):
+    with (
+        patch("manifold.paths.PID_FILE", pid_file),
+        patch("manifold.paths.PORT_FILE", port_file),
+    ):
         result = runner.invoke(app, ["down"])
         assert result.exit_code == 0
         assert "not found" in result.output
@@ -75,29 +75,67 @@ def test_down_stale_pid(tmp_path: Path):
 
 
 def test_stats_no_gateway(config_file: Path, tmp_path: Path):
-    with patch("manifold.cli.PORT_FILE", tmp_path / "no.port"), \
-         patch("manifold.cli._read_gateway_address", return_value="127.0.0.1:19999"):
+    with (
+        patch("manifold.paths.PORT_FILE", tmp_path / "no.port"),
+        patch("manifold.cli._read_gateway_address", return_value="127.0.0.1:19999"),
+    ):
         result = runner.invoke(app, ["stats", "--config", str(config_file)])
         assert result.exit_code == 1
+
+
+def test_add_command_gateway_startup_health(tmp_path: Path):
+    config_file = tmp_path / "manifold.yaml"
+    config_file.write_text("gateway:\n  host: 127.0.0.1\n  port: 9000\npipeline: []\n")
+    result = runner.invoke(
+        app,
+        ["add", "--config", str(config_file)],
+        input=(
+            "gw-svc\n"
+            "/tmp/x\n"
+            "echo test --port {port}\n"
+            "8122\n"
+            "/health\n"
+            "\n"
+            "cli_arg\n"
+            "y\n"
+            "45\n"
+            "0.1\n"
+            "y\n"
+        ),
+    )
+    assert result.exit_code == 0
+    import yaml
+
+    data = yaml.safe_load(config_file.read_text())
+    assert data["gateway"]["startup_health_timeout"] == 45
+    assert data["gateway"]["startup_health_poll_interval"] == 0.1
+    assert data["gateway"]["startup_health_strict"] is True
+    assert any(s["name"] == "gw-svc" for s in data["pipeline"])
 
 
 def test_add_command(tmp_path: Path):
     config_file = tmp_path / "manifold.yaml"
     config_file.write_text("gateway:\n  port: 9000\npipeline: []\n")
 
-    result = runner.invoke(app, ["add", "--config", str(config_file)], input=(
-        "new-svc\n"
-        "/tmp/new-svc\n"
-        "echo start --port {port} --upstream {upstream}\n"
-        "7099\n"
-        "/healthz\n"
-        "\n"  # skip stats
-        "cli_arg\n"
-    ))
+    result = runner.invoke(
+        app,
+        ["add", "--config", str(config_file)],
+        input=(
+            "new-svc\n"
+            "/tmp/new-svc\n"
+            "echo start --port {port} --upstream {upstream}\n"
+            "7099\n"
+            "/healthz\n"
+            "\n"  # skip stats
+            "cli_arg\n"
+            "\n"  # decline gateway startup health options (default No)
+        ),
+    )
     assert result.exit_code == 0
     assert "Added 'new-svc'" in result.output
 
     import yaml
+
     with open(config_file) as f:
         data = yaml.safe_load(f)
     assert len(data["pipeline"]) == 1

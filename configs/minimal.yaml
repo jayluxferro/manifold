@@ -3,6 +3,8 @@
 gateway:
   host: 127.0.0.1
   port: 9000
+  # startup_health_timeout: 120
+  # startup_health_strict: false
 
 pipeline:
   - name: hivemind

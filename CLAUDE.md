@@ -71,6 +71,10 @@ gateway:
   host: 127.0.0.1
   port: 9000
   fallback_upstream: https://api.anthropic.com  # or https://api.openai.com/v1
+  # Optional — after starting subprocesses, poll each enabled service's health:
+  startup_health_timeout: 120        # seconds (default 120)
+  startup_health_poll_interval: 0.25 # seconds between rounds (default 0.25)
+  startup_health_strict: false       # if true, `manifold up` exits non-zero on timeout
 
 pipeline:   # order matters — first service receives agent requests
   - name: my-redactor
@@ -119,6 +123,16 @@ pipeline:   # order matters — first service receives agent requests
 | `upstream_via` | no | `config_file` (default) or `cli_arg` |
 | `upstream_path` | no | Path suffix appended to the upstream URL |
 | `enabled` | no | `true` (default) or `false` to skip |
+
+### Gateway-only fields
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `startup_health_timeout` | no | Seconds to wait for every enabled service to return 2xx on `health` before starting the gateway (default `120`). |
+| `startup_health_poll_interval` | no | Seconds between health polling rounds (default `0.25`; must be ≤ `startup_health_timeout`). |
+| `startup_health_strict` | no | If `true`, `manifold up` exits with status 1 when the timeout elapses without all services healthy. Default `false` (warn and continue). |
+
+On **Windows**, subprocess teardown uses `terminate`/`kill` on the shell process only; on **Unix**, Manifold uses a process group (`killpg`) so nested children started by the shell are stopped together. Fully detached children can still survive on Windows; use **WSL** or an external process-tree kill if you need Unix-like behavior.
 
 ## Adding Your Own Service
 
@@ -175,6 +189,12 @@ src/manifold/
 - **Process management is simple** — Just subprocesses with PID tracking. No containers, no systemd. Keep it simple.
 - **Each service owns its own port** — No port multiplexing. Each service gets its own port as defined in the config.
 - **Auth header passthrough** — The gateway normalizes `Authorization: Bearer` to `x-api-key` and forwards all headers through the chain.
+
+## Repo automation
+- **CI** — `.github/workflows/ci.yml` runs **pre-commit** (**ruff** + **ruff format**), **pytest** with **coverage** (XML artifact; `mcp_server.py` omitted from the percentage gate), and `workflow_dispatch` for manual runs.
+- **Release** — `.github/workflows/release.yml` runs on tags `v*.*.*`, runs `uv build`, and publishes `dist/*` to a GitHub Release.
+- **Dependabot** — `.github/dependabot.yml` bumps **GitHub Actions** and **uv** dependencies weekly.
+- **pre-commit** — `.pre-commit-config.yaml` mirrors CI lint/format locally (`pre-commit install` after `pip install pre-commit`).
 
 ## Tech Stack
 - Python 3.12+, `uv` for package management

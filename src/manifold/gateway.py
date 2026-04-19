@@ -11,7 +11,9 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from manifold.models import PipelineState, GatewayConfig
+from manifold.models import GatewayConfig, PipelineState
+from manifold.paths import PID_FILE, PORT_FILE
+from manifold.process import stop_all, sync_kill_tracked_subprocesses
 
 log = logging.getLogger(__name__)
 
@@ -69,7 +71,12 @@ async def _proxy(request: Request) -> Response:
     except (httpx.ConnectError, httpx.TransportError) as exc:
         log.error("Upstream connect error: %s", exc)
         return JSONResponse(
-            {"error": {"type": "proxy_error", "message": f"Upstream unreachable: {target}"}},
+            {
+                "error": {
+                    "type": "proxy_error",
+                    "message": f"Upstream unreachable: {target}",
+                }
+            },
             status_code=502,
         )
     except httpx.TimeoutException:
@@ -87,6 +94,7 @@ async def _proxy(request: Request) -> Response:
     is_streaming = "text/event-stream" in content_type
 
     if is_streaming:
+
         async def stream_body():
             try:
                 async for chunk in upstream_resp.aiter_bytes():
@@ -128,21 +136,25 @@ async def _manifold_config(request: Request) -> JSONResponse:
         return JSONResponse({"error": "not initialized"}, status_code=503)
     services = []
     for s in _pipeline.services:
-        services.append({
-            "name": s.config.name,
-            "port": s.config.port,
-            "enabled": s.config.enabled,
-            "status": s.status.value,
-            "upstream": s.upstream_url,
-            "pid": s.pid,
-        })
-    return JSONResponse({
-        "gateway": {
-            "host": _gateway_config.host,
-            "port": _gateway_config.port,
-        },
-        "pipeline": services,
-    })
+        services.append(
+            {
+                "name": s.config.name,
+                "port": s.config.port,
+                "enabled": s.config.enabled,
+                "status": s.status.value,
+                "upstream": s.upstream_url,
+                "pid": s.pid,
+            }
+        )
+    return JSONResponse(
+        {
+            "gateway": {
+                "host": _gateway_config.host,
+                "port": _gateway_config.port,
+            },
+            "pipeline": services,
+        }
+    )
 
 
 def create_app(
@@ -167,13 +179,36 @@ def create_app(
         global _http_client
         _http_client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0))
         yield
-        await _http_client.aclose()
+        try:
+            await _http_client.aclose()
+        finally:
+            # Uvicorn's signal wrapper re-raises SIGINT/SIGTERM after serve() returns
+            # (see uvicorn.server.Server.capture_signals), which can terminate the
+            # process before outer finally blocks run — stop children here while the
+            # event loop is still alive. Runs even if aclose() fails so we do not leak
+            # pipeline subprocesses.
+            if _pipeline is not None:
+                log.info("Stopping pipeline services...")
+                try:
+                    await stop_all(_pipeline.services)
+                except Exception:
+                    log.exception(
+                        "Error stopping pipeline services during gateway shutdown"
+                    )
+                _pipeline.gateway_running = False
+            sync_kill_tracked_subprocesses()
+            PID_FILE.unlink(missing_ok=True)
+            PORT_FILE.unlink(missing_ok=True)
 
     routes = [
         Route("/_manifold/health", _manifold_health, methods=["GET"]),
         Route("/_manifold/stats", _manifold_stats, methods=["GET"]),
         Route("/_manifold/config", _manifold_config, methods=["GET"]),
-        Route("/{path:path}", _proxy, methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"]),
+        Route(
+            "/{path:path}",
+            _proxy,
+            methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"],
+        ),
     ]
 
     return Starlette(routes=routes, lifespan=lifespan)

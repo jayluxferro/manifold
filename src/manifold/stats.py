@@ -64,11 +64,7 @@ async def aggregate_stats(
                 "upstream": state.upstream_url,
             }
 
-            if (
-                svc.stats
-                and svc.enabled
-                and state.status == ServiceStatus.HEALTHY
-            ):
+            if svc.stats and svc.enabled and state.status == ServiceStatus.HEALTHY:
                 entry["stats"] = await fetch_service_stats(
                     svc.name, svc.port, svc.stats, client
                 )

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import logging
 from pathlib import Path
 
@@ -12,7 +11,6 @@ from manifold.models import (
     GatewayConfig,
     PipelineState,
     ServiceConfig,
-    ServiceState,
     ServiceStatus,
     UpstreamVia,
 )
@@ -67,7 +65,9 @@ def compute_upstreams(
         if i + 1 < len(enabled):
             next_svc = enabled[i + 1]
             base = f"http://127.0.0.1:{next_svc.port}"
-            upstreams[svc.name] = f"{base}{svc.upstream_path}" if svc.upstream_path else base
+            upstreams[svc.name] = (
+                f"{base}{svc.upstream_path}" if svc.upstream_path else base
+            )
         else:
             upstreams[svc.name] = fallback_upstream
     return upstreams

@@ -3,7 +3,6 @@
 import textwrap
 from pathlib import Path
 
-import pytest
 import yaml
 
 from manifold.chain import (
@@ -13,7 +12,6 @@ from manifold.chain import (
     get_entry_url,
     patch_service_config,
     resolve_command,
-    wire_pipeline,
 )
 from manifold.models import (
     GatewayConfig,
@@ -25,7 +23,9 @@ from manifold.models import (
 )
 
 
-def _svc(name: str, port: int, enabled: bool = True, via: UpstreamVia = UpstreamVia.CLI_ARG) -> ServiceConfig:
+def _svc(
+    name: str, port: int, enabled: bool = True, via: UpstreamVia = UpstreamVia.CLI_ARG
+) -> ServiceConfig:
     return ServiceConfig(
         name=name,
         directory="/tmp",
@@ -129,30 +129,40 @@ class TestPatchServiceConfig:
 
 class TestGetEntryUrl:
     def test_returns_first_healthy(self):
-        pipeline = PipelineState(services=[
-            ServiceState(config=_svc("a", 7001), status=ServiceStatus.UNHEALTHY),
-            ServiceState(config=_svc("b", 7002), status=ServiceStatus.HEALTHY),
-        ])
+        pipeline = PipelineState(
+            services=[
+                ServiceState(config=_svc("a", 7001), status=ServiceStatus.UNHEALTHY),
+                ServiceState(config=_svc("b", 7002), status=ServiceStatus.HEALTHY),
+            ]
+        )
         gw = GatewayConfig()
         assert get_entry_url(pipeline, gw) == "http://127.0.0.1:7002"
 
     def test_returns_starting_if_no_healthy(self):
-        pipeline = PipelineState(services=[
-            ServiceState(config=_svc("a", 7001), status=ServiceStatus.STARTING),
-        ])
+        pipeline = PipelineState(
+            services=[
+                ServiceState(config=_svc("a", 7001), status=ServiceStatus.STARTING),
+            ]
+        )
         gw = GatewayConfig()
         assert get_entry_url(pipeline, gw) == "http://127.0.0.1:7001"
 
     def test_returns_fallback_if_all_down(self):
-        pipeline = PipelineState(services=[
-            ServiceState(config=_svc("a", 7001), status=ServiceStatus.STOPPED),
-        ])
+        pipeline = PipelineState(
+            services=[
+                ServiceState(config=_svc("a", 7001), status=ServiceStatus.STOPPED),
+            ]
+        )
         gw = GatewayConfig()
         assert get_entry_url(pipeline, gw) == "https://api.anthropic.com"
 
     def test_skips_disabled(self):
-        pipeline = PipelineState(services=[
-            ServiceState(config=_svc("a", 7001, enabled=False), status=ServiceStatus.HEALTHY),
-        ])
+        pipeline = PipelineState(
+            services=[
+                ServiceState(
+                    config=_svc("a", 7001, enabled=False), status=ServiceStatus.HEALTHY
+                ),
+            ]
+        )
         gw = GatewayConfig()
         assert get_entry_url(pipeline, gw) == "https://api.anthropic.com"

@@ -46,6 +46,11 @@ class GatewayConfig:
     host: str = "127.0.0.1"
     port: int = 9000
     fallback_upstream: str = "https://api.anthropic.com"
+    # After subprocesses start, poll each enabled service's health until ready or timeout.
+    startup_health_timeout: float = 120.0
+    startup_health_poll_interval: float = 0.25
+    # If true, ``manifold up`` exits non-zero when startup health never succeeds.
+    startup_health_strict: bool = False
 
 
 @dataclass

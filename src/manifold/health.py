@@ -7,7 +7,7 @@ import logging
 
 import httpx
 
-from manifold.chain import get_entry_url, rewire_around
+from manifold.chain import rewire_around
 from manifold.models import GatewayConfig, PipelineState, ServiceState, ServiceStatus
 
 log = logging.getLogger(__name__)
@@ -15,6 +15,10 @@ log = logging.getLogger(__name__)
 DEFAULT_INTERVAL = 5.0
 FAILURE_THRESHOLD = 3  # consecutive failures before marking unhealthy
 HEALTH_TIMEOUT = 3.0
+
+
+class StartupHealthTimeoutError(Exception):
+    """Raised when ``startup_health_strict`` is true and services never become healthy."""
 
 
 async def check_service_health(
@@ -33,6 +37,52 @@ async def check_service_health(
     except (httpx.ConnectError, httpx.TimeoutException) as exc:
         log.debug("%s health check failed: %s", svc.name, exc)
         return False
+
+
+async def wait_for_services_ready(
+    pipeline: PipelineState,
+    gateway: GatewayConfig,
+) -> None:
+    """Poll enabled services until each passes ``health`` or the gateway timeout elapses.
+
+    Uses ``gateway.startup_health_timeout``, ``startup_health_poll_interval``, and
+    ``startup_health_strict``. On timeout: if strict, raises
+    :exc:`StartupHealthTimeoutError`; otherwise logs a warning and returns so the
+    gateway can still start.
+    """
+    enabled = [s for s in pipeline.services if s.config.enabled]
+    if not enabled:
+        return
+
+    timeout = gateway.startup_health_timeout
+    poll_interval = gateway.startup_health_poll_interval
+    strict = gateway.startup_health_strict
+
+    log.info("Waiting for services to become healthy (timeout %ss)...", int(timeout))
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+
+    async with httpx.AsyncClient() as client:
+        while loop.time() < deadline:
+            results = await asyncio.gather(
+                *[check_service_health(s, client) for s in enabled],
+            )
+            if all(results):
+                for svc in enabled:
+                    svc.status = ServiceStatus.HEALTHY
+                    svc.consecutive_failures = 0
+                log.info("All enabled services passed initial health check")
+                return
+            await asyncio.sleep(poll_interval)
+
+    names = ", ".join(s.config.name for s in enabled)
+    msg = (
+        f"Timed out after {int(timeout)}s waiting for initial health on gateway "
+        f"{gateway.host}:{gateway.port}; services: {names}"
+    )
+    if strict:
+        raise StartupHealthTimeoutError(msg)
+    log.warning("%s — starting gateway anyway", msg)
 
 
 async def run_health_checks(

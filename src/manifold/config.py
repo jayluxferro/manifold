@@ -97,10 +97,23 @@ def _parse_service(raw: dict) -> ServiceConfig:
 
 def _parse_gateway(raw: dict | None) -> GatewayConfig:
     raw = raw or {}
+    timeout = float(raw.get("startup_health_timeout", 120.0))
+    poll = float(raw.get("startup_health_poll_interval", 0.25))
+    if timeout <= 0:
+        raise ConfigError("gateway.startup_health_timeout must be > 0")
+    if poll <= 0:
+        raise ConfigError("gateway.startup_health_poll_interval must be > 0")
+    if poll > timeout:
+        raise ConfigError(
+            "gateway.startup_health_poll_interval must be <= gateway.startup_health_timeout"
+        )
     return GatewayConfig(
         host=raw.get("host", "127.0.0.1"),
         port=int(raw.get("port", 9000)),
         fallback_upstream=raw.get("fallback_upstream", "https://api.anthropic.com"),
+        startup_health_timeout=timeout,
+        startup_health_poll_interval=poll,
+        startup_health_strict=bool(raw.get("startup_health_strict", False)),
     )
 
 
@@ -111,13 +124,17 @@ def load_config(path: str | Path | None = None) -> ManifoldConfig:
         raw = yaml.safe_load(f)
 
     if not isinstance(raw, dict):
-        raise ConfigError(f"Config file must be a YAML mapping, got {type(raw).__name__}")
+        raise ConfigError(
+            f"Config file must be a YAML mapping, got {type(raw).__name__}"
+        )
 
     gateway = _parse_gateway(raw.get("gateway"))
 
     pipeline_raw = raw.get("pipeline")
     if not pipeline_raw or not isinstance(pipeline_raw, list):
-        raise ConfigError("Config must contain a 'pipeline' list with at least one service")
+        raise ConfigError(
+            "Config must contain a 'pipeline' list with at least one service"
+        )
 
     services = [_parse_service(entry) for entry in pipeline_raw]
 
@@ -132,14 +149,13 @@ def load_config(path: str | Path | None = None) -> ManifoldConfig:
         raise ConfigError("Duplicate service ports detected")
 
     if gateway.port in ports:
-        raise ConfigError(
-            f"Gateway port {gateway.port} conflicts with a service port"
-        )
+        raise ConfigError(f"Gateway port {gateway.port} conflicts with a service port")
 
     # Warn about missing directories (non-fatal — service may be on another machine)
     for svc in services:
         if not Path(svc.directory).is_dir():
             import warnings
+
             warnings.warn(
                 f"Service '{svc.name}': directory does not exist: {svc.directory}",
                 stacklevel=2,
