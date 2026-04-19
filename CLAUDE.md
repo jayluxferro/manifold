@@ -2,10 +2,6 @@
 
 > Proxy mesh gateway that chains multiple LLM proxy services into a single transparent pipeline.
 
-## Project Location
-
-`/Users/jay/dev/ml/mcp/manifold/`
-
 ## What This Project Does
 
 Manifold is a **control plane + thin entry proxy** that wires multiple LLM proxy services (each with OpenAI/Anthropic-compatible APIs) into a linear chain. An agent points at one port and its requests flow transparently through every service before reaching the cloud API.
@@ -19,44 +15,29 @@ Manifold is a **control plane + thin entry proxy** that wires multiple LLM proxy
 
 ## The Problem It Solves
 
-We have multiple LLM proxy tools (llm-redactor, local-splitter, hivemind, and more coming) that each spin their own HTTP server with OpenAI + Anthropic compatible endpoints. Without manifold, you either:
+Multiple LLM proxy tools (redactors, routers, rate limiters, etc.) each spin their own HTTP server with OpenAI + Anthropic compatible endpoints. Without manifold, you either:
 - Use MCP for all of them (100+ tool definitions in context, agent must reason about ordering = slow + error-prone)
 - Manually configure each service's upstream to point to the next (fragile, manual, no health checks)
 
 With manifold: `export ANTHROPIC_BASE_URL=http://127.0.0.1:9000` — done.
 
-## Known Sibling Services
+## Quick Start
 
-These are the services manifold will chain. They all live in `/Users/jay/dev/ml/mcp/`:
+```bash
+# Install
+uv sync
 
-### llm-redactor (port 7789)
-- **Function**: Scrubs PII/secrets from requests before cloud, restores placeholders in responses
-- **Framework**: FastAPI/Uvicorn
-- **Endpoints**: `/v1/chat/completions`, `/v1/messages`, `/v1/redactor/stats`, `/v1/redactor/config`
-- **Health**: `/v1/redactor/config` (GET)
-- **Stats**: `/v1/redactor/stats` (GET)
-- **Config file**: `llm_redactor.yaml`
-- **Upstream config key**: `cloud_target.endpoint` (YAML path)
-- **Start command**: `uv run llm-redactor serve --port {port}`
+# Create your pipeline config (see Config Schema below)
+cp manifold.yaml.example manifold.yaml
+# Edit manifold.yaml — set directory paths and enable/disable services
 
-### local-splitter (port 7788)
-- **Function**: Routes trivial requests to local model, compresses context, caches responses
-- **Framework**: FastAPI/Uvicorn
-- **Endpoints**: `/v1/chat/completions`, `/v1/messages`, `/v1/models`, `/v1/splitter/stats`, `/healthz`
-- **Health**: `/healthz` (GET)
-- **Stats**: `/v1/splitter/stats` (GET)
-- **Config file**: `config.yaml` (or via `--config` flag)
-- **Upstream config key**: `models.cloud.endpoint` (YAML path)
-- **Start command**: `uv run local-splitter serve-http --config config.yaml --port {port}`
+# Start everything
+manifold up
 
-### hivemind (port 8765)
-- **Function**: Admission control, rate limiting, AIMD backpressure, token budgets, priority queue
-- **Framework**: Starlette/Uvicorn
-- **Endpoints**: `/{path:path}` (catch-all proxy), `/_health`, `/_stats`
-- **Health**: `/_health` (GET)
-- **Stats**: `/_stats` (GET)
-- **Upstream config**: `--upstream` CLI flag
-- **Start command**: `uv run hivemind proxy --port {port} --upstream {upstream_url}`
+# Point your agent at the gateway
+export ANTHROPIC_BASE_URL=http://127.0.0.1:9000    # Anthropic agents
+export OPENAI_API_BASE=http://127.0.0.1:9000/v1    # OpenAI agents
+```
 
 ## Architecture Overview
 
@@ -74,23 +55,14 @@ The gateway:
 
 ### Chain Wiring Logic
 - Service N's upstream = `http://127.0.0.1:{service_N+1_port}`
-- Last service's upstream = its own configured upstream (e.g., `https://api.anthropic.com`) — manifold does NOT touch it
+- Last service's upstream = the `fallback_upstream` (e.g., `https://api.anthropic.com`) — manifold does NOT touch it
 - If service N goes down, service N-1's upstream is temporarily rewired to service N+1
 
-### Request/Response Flow
+### Example Pipeline
 ```
-REQUEST:  Agent → Redactor(scrub) → Splitter(compress/route) → HiveMind(schedule/throttle) → Cloud
-RESPONSE: Cloud → HiveMind(track tokens) → Splitter(cache) → Redactor(restore) → Agent
+REQUEST:  Agent → Redactor(scrub PII) → Splitter(route/compress) → RateLimiter(throttle) → Cloud
+RESPONSE: Cloud → RateLimiter(track tokens) → Splitter(cache) → Redactor(restore PII) → Agent
 ```
-
-## Tech Stack
-- Python 3.12+
-- `uv` for package management (consistent with sibling projects)
-- `httpx` for async reverse proxy
-- `asyncio` for subprocess management
-- `pyyaml` for config
-- `typer` for CLI
-- No heavy frameworks — this is a thin control plane, not a fat proxy
 
 ## Config Schema (manifold.yaml)
 
@@ -98,80 +70,103 @@ RESPONSE: Cloud → HiveMind(track tokens) → Splitter(cache) → Redactor(rest
 gateway:
   host: 127.0.0.1
   port: 9000
+  fallback_upstream: https://api.anthropic.com  # or https://api.openai.com/v1
 
 pipeline:   # order matters — first service receives agent requests
-  - name: llm-redactor
-    directory: /Users/jay/dev/ml/mcp/llm-redactor
-    command: "uv run llm-redactor serve --port {port}"
+  - name: my-redactor
+    directory: /path/to/my-redactor         # absolute path to the service repo
+    command: "uv run my-redactor serve --port {port}"
     port: 7789
-    health: /v1/redactor/config
-    stats: /v1/redactor/stats
-    config_file: llm_redactor.yaml        # relative to directory
-    upstream_key: cloud_target.endpoint    # dot-path into YAML config to patch
+    health: /healthz                        # GET endpoint that returns 2xx when ready
+    stats: /stats                           # optional GET endpoint for metrics
+    config_file: config.yaml                # relative to directory
+    upstream_key: cloud_target.endpoint     # dot-path into YAML config to patch
+    upstream_via: config_file               # "config_file" or "cli_arg"
+    upstream_path: /v1                      # optional path suffix appended to upstream URL
     enabled: true
 
-  - name: local-splitter
-    directory: /Users/jay/dev/ml/mcp/local-splitter
-    command: "uv run local-splitter serve-http --config config.yaml --port {port}"
+  - name: my-router
+    directory: /path/to/my-router
+    command: "uv run my-router serve --port {port}"
     port: 7788
     health: /healthz
-    stats: /v1/splitter/stats
     config_file: config.yaml
     upstream_key: models.cloud.endpoint
+    upstream_via: config_file
     enabled: true
 
-  - name: hivemind
-    directory: /Users/jay/dev/ml/mcp/hivemind
-    command: "uv run hivemind proxy --port {port} --upstream {upstream}"
+  - name: my-rate-limiter
+    directory: /path/to/my-rate-limiter
+    command: "uv run my-limiter proxy --port {port} --upstream {upstream}"
     port: 8765
     health: /_health
-    stats: /_stats
-    upstream_key: null                     # uses {upstream} in command template instead
-    upstream_via: cli_arg                  # "config_file" or "cli_arg"
+    upstream_via: cli_arg                   # upstream injected via {upstream} template
     enabled: true
 ```
+
+### Service Config Fields
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | yes | Unique service identifier |
+| `directory` | yes | Absolute path to the service repo |
+| `command` | yes | Start command — use `{port}` and `{upstream}` templates |
+| `port` | yes | Port the service listens on |
+| `health` | yes | Health check endpoint path (must return 2xx) |
+| `stats` | no | Stats endpoint path for aggregation |
+| `config_file` | no | YAML config file to patch (relative to directory) |
+| `upstream_key` | no | Dot-path into config file for upstream URL |
+| `upstream_via` | no | `config_file` (default) or `cli_arg` |
+| `upstream_path` | no | Path suffix appended to the upstream URL |
+| `enabled` | no | `true` (default) or `false` to skip |
+
+## Adding Your Own Service
+
+Any HTTP service that exposes OpenAI-compatible (`/v1/chat/completions`) or Anthropic-compatible (`/v1/messages`) endpoints can be added to the pipeline. Requirements:
+
+1. Accept a configurable upstream URL (via config file or CLI flag)
+2. Forward requests to that upstream after processing
+3. Expose a health check endpoint
+4. Preserve request/response headers (especially `x-api-key`, `Authorization`)
+
+Register interactively: `manifold add`
+
+## CLI Commands
+
+```bash
+manifold up [-c manifold.yaml] [-v]   # Start all services + gateway
+manifold down                          # Stop a running instance
+manifold status [-c manifold.yaml]     # Show pipeline config and chain
+manifold stats [-c manifold.yaml]      # Fetch stats from running gateway
+manifold validate [-c manifold.yaml]   # Validate config without starting
+manifold add [-c manifold.yaml]        # Interactively add a new service
+```
+
+## Gateway Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `/_manifold/health` | Health status of all pipeline services |
+| `/_manifold/stats` | Aggregated stats from all services |
+| `/_manifold/config` | Current pipeline topology and service states |
+| `/{path}` | Proxy — forwards to the first healthy service |
 
 ## Implementation Modules
 
 ```
 src/manifold/
-├── __init__.py
-├── cli.py              # Typer CLI: start, stop, status, stats
+├── cli.py              # Typer CLI: up, down, status, stats, add, validate
 ├── config.py           # Load + validate manifold.yaml
 ├── gateway.py          # Thin httpx reverse proxy to first service
-├── chain.py            # Chain wiring logic: patch configs, compute upstreams
-├── health.py           # Periodic health checks, bypass/rewire on failure
-├── process.py          # Start/stop/restart service subprocesses
+├── chain.py            # Chain wiring: patch configs, compute upstreams, bypass
+├── health.py           # Periodic health checks, auto-rewire on failure
+├── process.py          # Subprocess lifecycle: start, stop, restart, crash recovery
+├── watcher.py          # Hot-reload on manifold.yaml changes
 ├── stats.py            # Aggregate stats from all services
-└── models.py           # Dataclasses: ServiceConfig, GatewayConfig, PipelineState
+├── logs.py             # Per-service log files (~/.manifold/logs/)
+├── models.py           # Dataclasses: ServiceConfig, GatewayConfig, PipelineState
+└── mcp_server.py       # MCP tools: status, stats, enable/disable, logs
 ```
-
-## Build Instructions
-
-### Phase 1: Core (MVP)
-1. `config.py` — Load and validate `manifold.yaml`, resolve service configs
-2. `models.py` — Dataclasses for all config types
-3. `chain.py` — Chain wiring: compute upstream URLs, patch service YAML configs (deep dot-path set), handle `upstream_via: cli_arg` by templating `{upstream}` in command strings
-4. `gateway.py` — Async httpx reverse proxy: receive request on `:9000`, forward to first service, stream response back. Must support SSE streaming (critical for LLM responses)
-5. `process.py` — Start services as subprocesses (`asyncio.create_subprocess_exec`), capture stdout/stderr, track PIDs, graceful shutdown
-6. `cli.py` — `manifold up` (start all + gateway), `manifold down` (stop all), `manifold status` (show service states)
-
-### Phase 2: Resilience
-7. `health.py` — Background task that pings each service's health endpoint every 5s. On failure: mark service unhealthy, rewire chain to bypass it. On recovery: rewire back in
-8. Chain bypass logic in `chain.py` — When a service is bypassed, update the previous service's upstream to skip it
-9. Graceful degradation — If ALL services are down, gateway forwards directly to cloud API (needs a fallback upstream in config)
-
-### Phase 3: Observability
-10. `stats.py` — Hit each service's stats endpoint, merge into unified JSON response
-11. `/_manifold/stats` endpoint on the gateway
-12. `/_manifold/health` endpoint showing all service states
-13. `/_manifold/config` endpoint showing current pipeline topology
-
-### Phase 4: Nice-to-haves
-14. `manifold add <name>` — Interactive service registration
-15. Hot-reload on `manifold.yaml` changes (watchdog)
-16. MCP server that exposes `manifold.status`, `manifold.stats`, `manifold.enable/disable` tools
-17. Log aggregation from all service subprocesses
 
 ## Key Design Decisions
 - **No request modification** — Manifold never inspects or modifies request/response bodies. It's a topology manager + entry proxy only.
@@ -179,16 +174,12 @@ src/manifold/
 - **Streaming is mandatory** — The gateway proxy MUST support SSE streaming pass-through since all LLM responses stream.
 - **Process management is simple** — Just subprocesses with PID tracking. No containers, no systemd. Keep it simple.
 - **Each service owns its own port** — No port multiplexing. Each service gets its own port as defined in the config.
+- **Auth header passthrough** — The gateway normalizes `Authorization: Bearer` to `x-api-key` and forwards all headers through the chain.
 
-## Testing
-- Unit tests for config loading, chain wiring, upstream computation
-- Integration tests that start mock services and verify chain forwarding
-- Use `pytest` + `pytest-asyncio` + `httpx` for async testing
-- Mock services can be simple FastAPI apps that echo requests with a service identifier header
-
-## Dependencies
+## Tech Stack
+- Python 3.12+, `uv` for package management
 - `httpx` — async HTTP client for proxying and health checks
+- `starlette` — lightweight ASGI framework for the gateway
+- `uvicorn` — ASGI server
 - `pyyaml` — config file loading and patching
 - `typer` — CLI framework
-- `uvicorn` — ASGI server for the gateway
-- `starlette` — lightweight ASGI framework for the gateway app (lighter than FastAPI, we don't need OpenAPI docs)
