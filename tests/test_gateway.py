@@ -1,6 +1,5 @@
 """Tests for manifold.gateway module."""
 
-
 import pytest
 from starlette.testclient import TestClient
 
