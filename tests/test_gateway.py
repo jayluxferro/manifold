@@ -73,8 +73,8 @@ def test_proxy_returns_502_when_upstream_down(client):
     assert resp.status_code == 502
 
 
-def test_lifespan_shutdown_stops_pipeline_and_clears_pid_files(tmp_path):
-    """Teardown must run during ASGI shutdown (before uvicorn re-raises signals)."""
+def test_lifespan_closes_http_client():
+    """Lifespan teardown closes the HTTP client (service cleanup is in _run_pipeline)."""
     pipeline = _make_pipeline()
     gw = GatewayConfig()
     app = create_app(
@@ -82,18 +82,11 @@ def test_lifespan_shutdown_stops_pipeline_and_clears_pid_files(tmp_path):
         gateway_config=gw,
         get_entry_url=lambda: "http://127.0.0.1:7001",
     )
-    pid_file = tmp_path / "manifold.pid"
-    port_file = tmp_path / "manifold.port"
-    pid_file.write_text("1")
-    port_file.write_text("127.0.0.1:9000")
-    with (
-        patch("manifold.gateway.stop_all", new_callable=AsyncMock) as stop_all_mock,
-        patch("manifold.gateway.PID_FILE", pid_file),
-        patch("manifold.gateway.PORT_FILE", port_file),
-    ):
-        with TestClient(app):
-            pass
-        stop_all_mock.assert_awaited_once_with(pipeline.services)
-        assert pipeline.gateway_running is False
-    assert not pid_file.exists()
-    assert not port_file.exists()
+    import manifold.gateway as gw_mod
+
+    with TestClient(app):
+        # HTTP client should be created during lifespan startup
+        assert gw_mod._http_client is not None
+        assert not gw_mod._http_client.is_closed
+    # After lifespan teardown, client is closed
+    assert gw_mod._http_client.is_closed

@@ -12,8 +12,6 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from manifold.models import GatewayConfig, PipelineState
-from manifold.paths import PID_FILE, PORT_FILE
-from manifold.process import stop_all, sync_kill_tracked_subprocesses
 
 log = logging.getLogger(__name__)
 
@@ -179,26 +177,7 @@ def create_app(
         global _http_client
         _http_client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0))
         yield
-        try:
-            await _http_client.aclose()
-        finally:
-            # Uvicorn's signal wrapper re-raises SIGINT/SIGTERM after serve() returns
-            # (see uvicorn.server.Server.capture_signals), which can terminate the
-            # process before outer finally blocks run — stop children here while the
-            # event loop is still alive. Runs even if aclose() fails so we do not leak
-            # pipeline subprocesses.
-            if _pipeline is not None:
-                log.info("Stopping pipeline services...")
-                try:
-                    await stop_all(_pipeline.services)
-                except Exception:
-                    log.exception(
-                        "Error stopping pipeline services during gateway shutdown"
-                    )
-                _pipeline.gateway_running = False
-            sync_kill_tracked_subprocesses()
-            PID_FILE.unlink(missing_ok=True)
-            PORT_FILE.unlink(missing_ok=True)
+        await _http_client.aclose()
 
     routes = [
         Route("/_manifold/health", _manifold_health, methods=["GET"]),

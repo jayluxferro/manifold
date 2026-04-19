@@ -107,6 +107,19 @@ def patch_service_config(service: ServiceConfig, upstream_url: str) -> None:
         data = yaml.safe_load(f) or {}
 
     original = _deep_get(data, service.upstream_key)
+
+    # Skip the write when the value is already correct — rewriting the file
+    # would bump its mtime and trigger hot-reload in services that watch
+    # their own config, causing unnecessary cascading restarts.
+    if original == upstream_url:
+        log.debug(
+            "%s: %s already set to %s, skipping",
+            config_path,
+            service.upstream_key,
+            upstream_url,
+        )
+        return
+
     _deep_set(data, service.upstream_key, upstream_url)
 
     with open(config_path, "w") as f:

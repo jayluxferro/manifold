@@ -192,7 +192,11 @@ async def _run_pipeline(config_path: str | None, verbose: bool) -> None:
     enabled_names = [s.config.name for s in pipeline.services if s.config.enabled]
     log.info("Pipeline: %s", " → ".join(enabled_names))
 
-    # Run uvicorn
+    # Run uvicorn — we bypass server.serve() and call startup/main_loop/
+    # shutdown directly so we own signal handling.  Uvicorn's
+    # capture_signals() re-raises SIGINT after lifespan teardown and skips
+    # lifespan entirely on a second Ctrl+C (force_exit), which orphans
+    # pipeline child processes.
     uvi_config = uvicorn.Config(
         app=gateway_app,
         host=cfg.gateway.host,
@@ -201,19 +205,43 @@ async def _run_pipeline(config_path: str | None, verbose: bool) -> None:
     )
     server = uvicorn.Server(uvi_config)
 
+    # Replicate the initialisation that _serve() does before startup()
+    if not server.config.loaded:
+        server.config.load()
+    server.lifespan = server.config.lifespan_class(server.config)
+
+    # Install our own signal handlers so cleanup always runs.
+    loop = asyncio.get_running_loop()
+    _shutting_down = False
+
+    def _handle_shutdown():
+        nonlocal _shutting_down
+        if not _shutting_down:
+            _shutting_down = True
+            log.info("Shutting down gracefully (press Ctrl+C again to force)...")
+            server.should_exit = True
+        else:
+            log.warning("Forced shutdown — killing all services")
+            sync_kill_tracked_subprocesses()
+            os._exit(1)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, _handle_shutdown)
+
     try:
-        await server.serve()
-    except (KeyboardInterrupt, SystemExit):
-        pass
+        await server.startup()
+        if not server.should_exit:
+            await server.main_loop()
+        if server.started:
+            await server.shutdown()
     finally:
         stop_event.set()
         health_task.cancel()
         watcher_task.cancel()
         await asyncio.gather(health_task, watcher_task, return_exceptions=True)
-        # The gateway lifespan may have already stopped services during
-        # uvicorn shutdown.  Only run teardown if it hasn't happened yet.
+
         if pipeline.gateway_running:
-            log.info("Shutting down...")
+            log.info("Stopping pipeline services...")
             try:
                 await stop_all(pipeline.services)
             except Exception:
@@ -223,6 +251,13 @@ async def _run_pipeline(config_path: str | None, verbose: bool) -> None:
             paths.PID_FILE.unlink(missing_ok=True)
             paths.PORT_FILE.unlink(missing_ok=True)
             log.info("Manifold stopped.")
+
+        # Remove signal handlers — cleanup is done
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.remove_signal_handler(sig)
+            except Exception:
+                pass
 
 
 @app.command()
