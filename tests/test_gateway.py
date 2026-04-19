@@ -1,6 +1,5 @@
 """Tests for manifold.gateway module."""
 
-from unittest.mock import AsyncMock, patch
 
 import pytest
 from starlette.testclient import TestClient
