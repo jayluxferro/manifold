@@ -186,7 +186,9 @@ def rewire_around(
         new_upstream = upstreams[svc.name]
         if state.upstream_url != new_upstream:
             state.upstream_url = new_upstream
-            log.info("Rewired %s upstream to %s (in-memory only)", svc.name, new_upstream)
+            log.info(
+                "Rewired %s upstream to %s (in-memory only)", svc.name, new_upstream
+            )
 
     return upstreams
 

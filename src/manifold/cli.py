@@ -121,9 +121,7 @@ async def _run_pipeline(config_path: str | None, verbose: bool) -> None:
 
     def _handle_crash(state: ServiceState) -> None:
         name = state.config.name
-        log.warning(
-            "Service '%s' crashed — rewiring chain to bypass it", name
-        )
+        log.warning("Service '%s' crashed — rewiring chain to bypass it", name)
         rewire_around(pipeline, cfg.gateway)
 
         # Schedule auto-restart with exponential backoff
