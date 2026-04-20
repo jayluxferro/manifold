@@ -17,6 +17,7 @@ import yaml
 from manifold.chain import (
     compute_upstreams,
     get_entry_url,
+    patch_service_config,
     wire_pipeline,
 )
 from manifold.config import ConfigError, find_config, load_config
@@ -28,7 +29,7 @@ from manifold.health import (
     StartupHealthTimeoutError,
 )
 from manifold.watcher import watch_config
-from manifold.models import PipelineState, ServiceState
+from manifold.models import PipelineState, ServiceState, ServiceStatus, UpstreamVia
 from manifold.process import (
     set_on_crash,
     start_service,
@@ -111,14 +112,42 @@ async def _run_pipeline(config_path: str | None, verbose: bool) -> None:
         services=[ServiceState(config=svc) for svc in cfg.pipeline]
     )
 
-    # Register crash callback so chain rewires immediately on service exit
+    # Register crash callback: rewire chain, then schedule auto-restart
     from manifold.chain import rewire_around
 
+    _restart_delays: dict[str, float] = {}
+    _MAX_RESTART_DELAY = 60.0
+    _BASE_RESTART_DELAY = 2.0
+
     def _handle_crash(state: ServiceState) -> None:
+        name = state.config.name
         log.warning(
-            "Service '%s' crashed — rewiring chain to bypass it", state.config.name
+            "Service '%s' crashed — rewiring chain to bypass it", name
         )
         rewire_around(pipeline, cfg.gateway)
+
+        # Schedule auto-restart with exponential backoff
+        if not state.config.enabled:
+            return
+        delay = _restart_delays.get(name, _BASE_RESTART_DELAY)
+        _restart_delays[name] = min(delay * 2, _MAX_RESTART_DELAY)
+        log.info("Will auto-restart '%s' in %.1fs", name, delay)
+
+        async def _do_restart():
+            await asyncio.sleep(delay)
+            if state.status == ServiceStatus.STOPPED:
+                return  # user explicitly stopped it
+            # Re-compute correct upstream and patch config before restarting
+            upstreams = compute_upstreams(cfg.pipeline, cfg.gateway.fallback_upstream)
+            upstream_url = upstreams.get(name, cfg.gateway.fallback_upstream)
+            svc = state.config
+            if svc.upstream_via == UpstreamVia.CONFIG_FILE:
+                patch_service_config(svc, upstream_url)
+            log.info("Auto-restarting '%s' with upstream %s", name, upstream_url)
+            await start_service(state, upstream_url)
+            _restart_delays.pop(name, None)
+
+        asyncio.ensure_future(_do_restart())
 
     set_on_crash(_handle_crash)
 

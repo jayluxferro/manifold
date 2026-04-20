@@ -147,14 +147,14 @@ class TestGetEntryUrl:
         gw = GatewayConfig()
         assert get_entry_url(pipeline, gw) == "http://127.0.0.1:7001"
 
-    def test_returns_fallback_if_all_down(self):
+    def test_returns_none_if_all_down(self):
         pipeline = PipelineState(
             services=[
                 ServiceState(config=_svc("a", 7001), status=ServiceStatus.STOPPED),
             ]
         )
         gw = GatewayConfig()
-        assert get_entry_url(pipeline, gw) == "https://api.anthropic.com"
+        assert get_entry_url(pipeline, gw) is None
 
     def test_skips_disabled(self):
         pipeline = PipelineState(
@@ -165,4 +165,4 @@ class TestGetEntryUrl:
             ]
         )
         gw = GatewayConfig()
-        assert get_entry_url(pipeline, gw) == "https://api.anthropic.com"
+        assert get_entry_url(pipeline, gw) is None

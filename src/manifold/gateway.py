@@ -25,18 +25,31 @@ _get_stats: callable = None
 _get_health: callable = None
 
 
-def _target_url() -> str:
-    """Resolve the current entry URL for proxying."""
+def _target_url() -> str | None:
+    """Resolve the current entry URL for proxying.
+
+    Returns None when no pipeline service is available — the gateway must
+    never bypass the pipeline and send directly to the cloud API.
+    """
     if _get_entry_url is not None:
         return _get_entry_url()
-    if _gateway_config is not None:
-        return _gateway_config.fallback_upstream
-    return "https://api.anthropic.com"
+    return None
 
 
 async def _proxy(request: Request) -> Response:
     """Forward an incoming request to the first pipeline service."""
     target = _target_url()
+    if target is None:
+        return JSONResponse(
+            {
+                "error": {
+                    "type": "proxy_error",
+                    "message": "Pipeline unavailable: no healthy services",
+                }
+            },
+            status_code=503,
+        )
+
     url = f"{target}{request.url.path}"
     if request.url.query:
         url = f"{url}?{request.url.query}"
@@ -44,6 +57,7 @@ async def _proxy(request: Request) -> Response:
     headers = dict(request.headers)
     headers.pop("host", None)
     headers.pop("transfer-encoding", None)
+    headers.pop("content-length", None)
 
     # Normalize auth: if client sends Authorization Bearer but not x-api-key,
     # extract the token and set x-api-key so downstream services and the

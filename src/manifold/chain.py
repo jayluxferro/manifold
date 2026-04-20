@@ -169,7 +169,12 @@ def rewire_around(
 ) -> dict[str, str]:
     """Rewire the chain to bypass unhealthy services.
 
-    Patches config files for config_file services that need new upstreams.
+    Updates in-memory upstream state only.  Config files are NOT patched here
+    because services that use config_file upstream don't hot-reload — the
+    running process ignores the disk change, and the stale fallback endpoint
+    on disk will cause auth failures if the service restarts later.  Instead,
+    the auto-restart logic re-patches correctly before relaunching.
+
     Returns the new upstream map.
     """
     upstreams = compute_active_upstreams(pipeline, gateway.fallback_upstream)
@@ -180,19 +185,19 @@ def rewire_around(
             continue
         new_upstream = upstreams[svc.name]
         if state.upstream_url != new_upstream:
-            if svc.upstream_via == UpstreamVia.CONFIG_FILE:
-                patch_service_config(svc, new_upstream)
             state.upstream_url = new_upstream
-            log.info("Rewired %s upstream to %s", svc.name, new_upstream)
+            log.info("Rewired %s upstream to %s (in-memory only)", svc.name, new_upstream)
 
     return upstreams
 
 
-def get_entry_url(pipeline: PipelineState, gateway: GatewayConfig) -> str:
+def get_entry_url(pipeline: PipelineState, gateway: GatewayConfig) -> str | None:
     """Get the URL the gateway should forward requests to.
 
-    This is the first healthy/starting service, or the fallback upstream
-    if everything is down.
+    Returns the first healthy/starting service, or None if the entire
+    pipeline is down.  The gateway must never bypass the pipeline and send
+    directly to the cloud — if no service is available, requests should
+    fail with 503.
     """
     for state in pipeline.services:
         if state.config.enabled and state.status in (
@@ -200,4 +205,4 @@ def get_entry_url(pipeline: PipelineState, gateway: GatewayConfig) -> str:
             ServiceStatus.STARTING,
         ):
             return f"http://127.0.0.1:{state.config.port}"
-    return gateway.fallback_upstream
+    return None

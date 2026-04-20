@@ -86,7 +86,11 @@ async def _apply_config_changes(
             await stop_service(state)
             pipeline.services.remove(state)
 
-    # Compute new upstreams
+    # Wire pipeline FIRST — patches config files with correct upstreams
+    # BEFORE any service is (re)started, so it reads the right endpoint.
+    wire_pipeline(new_cfg.pipeline, gateway)
+
+    # Compute upstreams for start/restart decisions
     upstreams = compute_upstreams(new_cfg.pipeline, gateway.fallback_upstream)
 
     # Update or add services
@@ -125,17 +129,11 @@ async def _apply_config_changes(
                 log.info("Upstream for '%s' changed to %s", new_svc.name, upstream_url)
                 state.upstream_url = upstream_url
         else:
-            # New service
+            # New service — config already patched by wire_pipeline above
             log.info("New service '%s' found in config", new_svc.name)
             state = ServiceState(config=new_svc)
             pipeline.services.append(state)
             if new_svc.enabled:
                 await start_service(state, upstream_url)
-
-    # Re-wire config files for all services
-    wire_pipeline(
-        [s.config for s in pipeline.services],
-        gateway,
-    )
 
     log.info("Config reload complete")
