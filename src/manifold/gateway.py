@@ -189,7 +189,12 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app):
         global _http_client
-        _http_client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0))
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(300.0, connect=10.0),
+            # Empty default user-agent so httpx doesn't inject python-httpx/X.Y.Z;
+            # the agent's original user-agent flows through via forwarded headers.
+            headers={"user-agent": ""},
+        )
         yield
         await _http_client.aclose()
 
