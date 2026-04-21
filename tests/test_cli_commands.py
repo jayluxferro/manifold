@@ -54,29 +54,44 @@ def test_status_shows_chain(config_file: Path):
 
 
 def test_down_no_pidfile(tmp_path: Path):
-    with patch("manifold.paths.PID_FILE", tmp_path / "no.pid"):
+    with patch("manifold.paths.PID_DIR", tmp_path):
         result = runner.invoke(app, ["down"])
         assert result.exit_code == 1
         assert "No running" in result.output
 
 
 def test_down_stale_pid(tmp_path: Path):
-    pid_file = tmp_path / "manifold.pid"
-    port_file = tmp_path / "manifold.port"
+    pid_file = tmp_path / "manifold-9000.pid"
     pid_file.write_text("999999999")  # unlikely to exist
-    with (
-        patch("manifold.paths.PID_FILE", pid_file),
-        patch("manifold.paths.PORT_FILE", port_file),
-    ):
+    with patch("manifold.paths.PID_DIR", tmp_path):
         result = runner.invoke(app, ["down"])
         assert result.exit_code == 0
         assert "not found" in result.output
         assert not pid_file.exists()
 
 
+def test_down_specific_port(tmp_path: Path):
+    pid_file = tmp_path / "manifold-9001.pid"
+    pid_file.write_text("999999999")
+    with patch("manifold.paths.PID_DIR", tmp_path):
+        result = runner.invoke(app, ["down", "--port", "9001"])
+        assert result.exit_code == 0
+        assert "not found" in result.output
+        assert not pid_file.exists()
+
+
+def test_down_multiple_instances(tmp_path: Path):
+    (tmp_path / "manifold-9000.pid").write_text("111")
+    (tmp_path / "manifold-9001.pid").write_text("222")
+    with patch("manifold.paths.PID_DIR", tmp_path):
+        result = runner.invoke(app, ["down"])
+        assert result.exit_code == 1
+        assert "Multiple" in result.output
+
+
 def test_stats_no_gateway(config_file: Path, tmp_path: Path):
     with (
-        patch("manifold.paths.PORT_FILE", tmp_path / "no.port"),
+        patch("manifold.paths.PID_DIR", tmp_path),
         patch("manifold.cli._read_gateway_address", return_value="127.0.0.1:19999"),
     ):
         result = runner.invoke(app, ["stats", "--config", str(config_file)])

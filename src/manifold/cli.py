@@ -97,7 +97,9 @@ def _setup_logging(verbose: bool) -> None:
     )
 
 
-async def _run_pipeline(config_path: str | None, verbose: bool) -> None:
+async def _run_pipeline(
+    config_path: str | None, verbose: bool, port_override: int | None = None
+) -> None:
     """Core async logic for 'manifold up'."""
     _setup_logging(verbose)
 
@@ -106,6 +108,37 @@ async def _run_pipeline(config_path: str | None, verbose: bool) -> None:
         cfg = load_config(config_path)
     except ConfigError as exc:
         log.error("Configuration error: %s", exc)
+        raise typer.Exit(1)
+
+    # Apply port offset when --port is given
+    if port_override is not None and port_override != cfg.gateway.port:
+        delta = port_override - cfg.gateway.port
+        log.info(
+            "Port override: gateway %d → %d (delta %+d)",
+            cfg.gateway.port,
+            port_override,
+            delta,
+        )
+        cfg.gateway.port = port_override
+        for svc in cfg.pipeline:
+            svc.port = svc.port + delta
+    elif port_override is not None:
+        pass  # --port matches config, no offset needed
+
+    # Check for port collisions before starting anything
+    service_ports = {s.name: s.port for s in cfg.pipeline if s.enabled}
+    collisions = paths.check_port_collisions(
+        cfg.gateway.port, service_ports, cfg.gateway.host
+    )
+    if collisions:
+        for msg in collisions:
+            log.error(msg)
+        enabled_count = len(service_ports)
+        suggested = cfg.gateway.port + enabled_count + 1
+        log.error(
+            "Port collision detected — try --port %d or higher to avoid conflicts",
+            suggested,
+        )
         raise typer.Exit(1)
 
     pipeline = PipelineState(
@@ -206,10 +239,13 @@ async def _run_pipeline(config_path: str | None, verbose: bool) -> None:
     )
     pipeline.gateway_running = True
 
-    # Write PID + port files for `manifold down` / `manifold stats`
+    # Write per-instance PID + port files for `manifold down` / `manifold stats`
+    gw_port = cfg.gateway.port
+    pid_file = paths.pid_file_for(gw_port)
+    port_file = paths.port_file_for(gw_port)
     paths.PID_DIR.mkdir(parents=True, exist_ok=True)
-    paths.atomic_write_text(paths.PID_FILE, str(os.getpid()))
-    paths.atomic_write_text(paths.PORT_FILE, f"{cfg.gateway.host}:{cfg.gateway.port}")
+    paths.atomic_write_text(pid_file, str(os.getpid()))
+    paths.atomic_write_text(port_file, f"{cfg.gateway.host}:{gw_port}")
 
     log.info(
         "Manifold gateway listening on %s:%d",
@@ -275,8 +311,8 @@ async def _run_pipeline(config_path: str | None, verbose: bool) -> None:
                 log.exception("Error stopping pipeline services")
             sync_kill_tracked_subprocesses()
             pipeline.gateway_running = False
-            paths.PID_FILE.unlink(missing_ok=True)
-            paths.PORT_FILE.unlink(missing_ok=True)
+            pid_file.unlink(missing_ok=True)
+            port_file.unlink(missing_ok=True)
             log.info("Manifold stopped.")
 
         # Remove signal handlers — cleanup is done
@@ -291,9 +327,15 @@ async def _run_pipeline(config_path: str | None, verbose: bool) -> None:
 def up(
     config: str = typer.Option(None, "--config", "-c", help="Path to manifold.yaml"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging"),
+    port: int = typer.Option(
+        None,
+        "--port",
+        "-p",
+        help="Override gateway port (service ports auto-offset by the same delta)",
+    ),
 ) -> None:
     """Start all services and the gateway."""
-    asyncio.run(_run_pipeline(config, verbose))
+    asyncio.run(_run_pipeline(config, verbose, port_override=port))
 
 
 @app.command()
@@ -339,28 +381,96 @@ def validate(
         raise typer.Exit(1)
 
 
-def _read_gateway_address() -> str | None:
-    """Read the gateway address from the port file."""
-    if paths.PORT_FILE.exists():
-        return paths.PORT_FILE.read_text().strip()
+def _discover_instances() -> list[tuple[int, Path, Path]]:
+    """Find all running manifold instances by globbing PID files.
+
+    Returns a list of (gateway_port, pid_file, port_file) tuples.
+    """
+    instances: list[tuple[int, Path, Path]] = []
+    if not paths.PID_DIR.is_dir():
+        return instances
+    for pf in sorted(paths.PID_DIR.glob("manifold-*.pid")):
+        # Extract port from filename: manifold-9000.pid -> 9000
+        stem = pf.stem  # manifold-9000
+        try:
+            gw_port = int(stem.split("-", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        port_f = paths.port_file_for(gw_port)
+        instances.append((gw_port, pf, port_f))
+    return instances
+
+
+def _resolve_instance(
+    port: int | None,
+) -> tuple[int, Path, Path]:
+    """Resolve which instance to target.
+
+    If *port* is given, use it directly. Otherwise discover instances:
+    - exactly one → use it
+    - zero → error
+    - multiple → error listing them
+    """
+    if port is not None:
+        pid_f = paths.pid_file_for(port)
+        port_f = paths.port_file_for(port)
+        if not pid_f.exists():
+            typer.echo(f"No manifold instance on port {port}.", err=True)
+            raise typer.Exit(1)
+        return port, pid_f, port_f
+
+    instances = _discover_instances()
+    if not instances:
+        typer.echo("No running manifold instance found.", err=True)
+        raise typer.Exit(1)
+    if len(instances) == 1:
+        return instances[0]
+    # Multiple instances — ask user to specify
+    ports_list = ", ".join(str(gw) for gw, _, _ in instances)
+    typer.echo(
+        f"Multiple manifold instances running (ports: {ports_list}). "
+        "Use --port to specify which one.",
+        err=True,
+    )
+    raise typer.Exit(1)
+
+
+def _read_gateway_address(port: int | None = None) -> str | None:
+    """Read the gateway address from a port file."""
+    if port is not None:
+        pf = paths.port_file_for(port)
+        if pf.exists():
+            return pf.read_text().strip()
+        return None
+    # Discover single instance
+    instances = _discover_instances()
+    if len(instances) == 1:
+        _, _, port_f = instances[0]
+        if port_f.exists():
+            return port_f.read_text().strip()
     return None
 
 
 @app.command()
-def down() -> None:
+def down(
+    port: int = typer.Option(
+        None,
+        "--port",
+        "-p",
+        help="Gateway port of the instance to stop",
+    ),
+) -> None:
     """Stop a running manifold instance."""
-    if not paths.PID_FILE.exists():
-        typer.echo("No running manifold instance found.", err=True)
-        raise typer.Exit(1)
+    gw_port, pid_file, port_file = _resolve_instance(port)
 
-    pid = int(paths.PID_FILE.read_text().strip())
+    pid = int(pid_file.read_text().strip())
     try:
         os.kill(pid, signal.SIGTERM)
-        typer.echo(f"Sent SIGTERM to manifold (pid={pid})")
+        typer.echo(f"Sent SIGTERM to manifold on port {gw_port} (pid={pid})")
     except ProcessLookupError:
         typer.echo(f"Process {pid} not found — cleaning up stale PID file.")
-        paths.PID_FILE.unlink(missing_ok=True)
-        paths.PORT_FILE.unlink(missing_ok=True)
+        pid_file.unlink(missing_ok=True)
+        port_file.unlink(missing_ok=True)
     except PermissionError:
         typer.echo(f"Permission denied sending signal to pid={pid}", err=True)
         raise typer.Exit(1)
@@ -369,9 +479,15 @@ def down() -> None:
 @app.command()
 def stats(
     config: str = typer.Option(None, "--config", "-c", help="Path to manifold.yaml"),
+    port: int = typer.Option(
+        None,
+        "--port",
+        "-p",
+        help="Gateway port of the instance to query",
+    ),
 ) -> None:
     """Fetch and display stats from a running manifold gateway."""
-    addr = _read_gateway_address()
+    addr = _read_gateway_address(port)
     if addr is None:
         # Fall back to config to find the port
         try:
