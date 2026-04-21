@@ -92,8 +92,24 @@ async def _proxy(request: Request) -> Response:
             status_code=502,
         )
     except httpx.TimeoutException:
+        log.error(
+            "Upstream timeout: %s %s → %s (client may have hit a rate/account limit "
+            "— try the request directly to see the original error)",
+            request.method,
+            request.url.path,
+            url,
+        )
         return JSONResponse(
-            {"error": {"type": "proxy_error", "message": "Upstream timeout"}},
+            {
+                "error": {
+                    "type": "proxy_error",
+                    "message": (
+                        f"Upstream timeout: {target} — if this persists, check "
+                        "whether you've hit a rate or account limit by sending "
+                        "a request directly to the cloud API"
+                    ),
+                }
+            },
             status_code=504,
         )
 
@@ -104,6 +120,36 @@ async def _proxy(request: Request) -> Response:
 
     content_type = upstream_resp.headers.get("content-type", "")
     is_streaming = "text/event-stream" in content_type
+
+    # Log non-2xx responses so upstream errors are visible in manifold logs
+    # even when the client doesn't surface the body.
+    if upstream_resp.status_code >= 400:
+        if is_streaming:
+            log.warning(
+                "Upstream error: %s %s → %s returned %d (streaming; body not logged)",
+                request.method,
+                request.url.path,
+                url,
+                upstream_resp.status_code,
+            )
+        else:
+            # Peek at the body to log it, then we'll still return it to the client.
+            error_body = await upstream_resp.aread()
+            snippet = error_body[:1024].decode("utf-8", errors="replace")
+            log.warning(
+                "Upstream error: %s %s → %s returned %d: %s",
+                request.method,
+                request.url.path,
+                url,
+                upstream_resp.status_code,
+                snippet,
+            )
+            await upstream_resp.aclose()
+            return Response(
+                content=error_body,
+                status_code=upstream_resp.status_code,
+                headers=resp_headers,
+            )
 
     if is_streaming:
 
