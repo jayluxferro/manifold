@@ -47,7 +47,8 @@ Each service already acts as a reverse proxy with a configurable upstream. Manif
 
 ```bash
 # Install
-cd /Users/jay/dev/ml/mcp/manifold
+git clone https://github.com/jayluxferro/manifold
+cd manifold
 uv sync
 
 # Configure your pipeline
@@ -74,7 +75,7 @@ gateway:
 
 pipeline:
   - name: llm-redactor
-    directory: /Users/jay/dev/ml/mcp/llm-redactor
+    directory: /llm-redactor
     command: "uv run llm-redactor serve --port {port}"
     port: 7789
     health: /v1/redactor/config
@@ -84,7 +85,7 @@ pipeline:
     enabled: true
 
   - name: local-splitter
-    directory: /Users/jay/dev/ml/mcp/local-splitter
+    directory: /local-splitter
     command: "uv run local-splitter serve-http --config config.yaml --port {port}"
     port: 7788
     health: /healthz
@@ -94,7 +95,7 @@ pipeline:
     enabled: true
 
   - name: hivemind
-    directory: /Users/jay/dev/ml/mcp/hivemind
+    directory: /hivemind
     command: "uv run hivemind proxy --port {port} --upstream {upstream}"
     port: 8765
     health: /_health
