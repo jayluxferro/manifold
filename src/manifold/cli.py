@@ -111,15 +111,11 @@ def _preflight_check(cfg) -> list[str]:
             continue
         d = Path(svc.directory)
         if not d.is_dir():
-            warnings.append(
-                f"Service '{svc.name}': directory does not exist: {d}"
-            )
+            warnings.append(f"Service '{svc.name}': directory does not exist: {d}")
         elif svc.upstream_via == UpstreamVia.CONFIG_FILE and svc.config_file:
             cf = d / svc.config_file
             if not cf.is_file():
-                warnings.append(
-                    f"Service '{svc.name}': config file not found: {cf}"
-                )
+                warnings.append(f"Service '{svc.name}': config file not found: {cf}")
 
     # --- port collisions ---------------------------------------------------
     service_ports = {s.name: s.port for s in cfg.pipeline if s.enabled}
