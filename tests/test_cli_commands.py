@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
 from manifold.cli import app
@@ -156,3 +157,91 @@ def test_add_command(tmp_path: Path):
     assert len(data["pipeline"]) == 1
     assert data["pipeline"][0]["name"] == "new-svc"
     assert data["pipeline"][0]["port"] == 7099
+
+
+def test_preflight_check_passes():
+    from manifold.cli import _preflight_check
+    from manifold.models import GatewayConfig, ManifoldConfig, ServiceConfig
+
+    cfg = ManifoldConfig(
+        gateway=GatewayConfig(
+            port=9000, startup_health_timeout=30, startup_health_poll_interval=5
+        ),
+        pipeline=[
+            ServiceConfig(
+                name="ok",
+                directory="/tmp",
+                command="echo",
+                port=7001,
+                health="/h",
+            )
+        ],
+    )
+    with patch("manifold.paths.is_port_in_use", return_value=False):
+        warnings = _preflight_check(cfg)
+    assert warnings == []
+
+
+def test_preflight_rejects_swapped_health():
+    from manifold.cli import _preflight_check
+    from manifold.models import GatewayConfig, ManifoldConfig
+
+    cfg = ManifoldConfig(
+        gateway=GatewayConfig(
+            port=9000, startup_health_timeout=5, startup_health_poll_interval=120
+        ),
+        pipeline=[],
+    )
+    with patch("manifold.paths.is_port_in_use", return_value=False):
+        with pytest.raises(typer.Exit):
+            _preflight_check(cfg)
+
+
+def test_preflight_warns_missing_directory():
+    from manifold.cli import _preflight_check
+    from manifold.models import GatewayConfig, ManifoldConfig, ServiceConfig
+
+    cfg = ManifoldConfig(
+        gateway=GatewayConfig(port=9000),
+        pipeline=[
+            ServiceConfig(
+                name="missing-dir",
+                directory="/nonexistent/path/xyz",
+                command="echo",
+                port=7001,
+                health="/h",
+            )
+        ],
+    )
+    with patch("manifold.paths.is_port_in_use", return_value=False):
+        warnings = _preflight_check(cfg)
+    assert any("does not exist" in w for w in warnings)
+
+
+def test_preflight_warns_missing_config_file(tmp_path: Path):
+    from manifold.cli import _preflight_check
+    from manifold.models import (
+        GatewayConfig,
+        ManifoldConfig,
+        ServiceConfig,
+        UpstreamVia,
+    )
+
+    cfg = ManifoldConfig(
+        gateway=GatewayConfig(port=9000),
+        pipeline=[
+            ServiceConfig(
+                name="missing-cfg",
+                directory=str(tmp_path),
+                command="echo",
+                port=7001,
+                health="/h",
+                upstream_via=UpstreamVia.CONFIG_FILE,
+                config_file="missing.yaml",
+                upstream_key="endpoint",
+            )
+        ],
+    )
+    with patch("manifold.paths.is_port_in_use", return_value=False):
+        warnings = _preflight_check(cfg)
+    assert any("config file not found" in w for w in warnings)
