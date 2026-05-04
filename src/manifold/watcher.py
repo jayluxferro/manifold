@@ -6,7 +6,7 @@ import asyncio
 import logging
 from pathlib import Path
 
-from manifold.chain import wire_pipeline, compute_upstreams
+from manifold.chain import rewire_around, wire_pipeline, compute_upstreams
 from manifold.config import ConfigError, load_config
 from manifold.models import GatewayConfig, ManifoldConfig, PipelineState, ServiceState
 from manifold.process import restart_service, start_service, stop_service
@@ -80,11 +80,13 @@ async def _apply_config_changes(
     gateway.fallback_upstream = new_cfg.gateway.fallback_upstream
 
     # Stop removed services
+    removed = False
     for name, state in old_by_name.items():
         if name not in new_by_name:
             log.info("Service '%s' removed from config, stopping", name)
             await stop_service(state)
             pipeline.services.remove(state)
+            removed = True
 
     # Wire pipeline FIRST — patches config files with correct upstreams
     # BEFORE any service is (re)started, so it reads the right endpoint.
@@ -94,6 +96,7 @@ async def _apply_config_changes(
     upstreams = compute_upstreams(new_cfg.pipeline, gateway.fallback_upstream)
 
     # Update or add services
+    changed = False
     for new_svc in new_cfg.pipeline:
         upstream_url = upstreams.get(new_svc.name, gateway.fallback_upstream)
 
@@ -108,9 +111,9 @@ async def _apply_config_changes(
                     await stop_service(state)
                 else:
                     log.info("Service '%s' enabled, starting", new_svc.name)
-                    state.config = new_svc
                     await start_service(state, upstream_url)
                 state.config = new_svc
+                changed = True
                 continue
 
             # Check if config changed in a way that requires restart
@@ -125,6 +128,7 @@ async def _apply_config_changes(
             if needs_restart and new_svc.enabled:
                 log.info("Service '%s' config changed, restarting", new_svc.name)
                 await restart_service(state, upstream_url)
+                changed = True
             elif state.upstream_url != upstream_url and new_svc.enabled:
                 log.info("Upstream for '%s' changed to %s", new_svc.name, upstream_url)
                 state.upstream_url = upstream_url
@@ -135,5 +139,9 @@ async def _apply_config_changes(
             pipeline.services.append(state)
             if new_svc.enabled:
                 await start_service(state, upstream_url)
+            changed = True
+
+    if changed or removed:
+        rewire_around(pipeline, gateway)
 
     log.info("Config reload complete")

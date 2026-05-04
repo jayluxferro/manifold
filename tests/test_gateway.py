@@ -1,5 +1,8 @@
 """Tests for manifold.gateway module."""
 
+from unittest.mock import AsyncMock
+
+import httpx
 import pytest
 from starlette.testclient import TestClient
 
@@ -66,9 +69,30 @@ def test_manifold_stats_returns_empty_without_callback(client):
     assert resp.json() == {}
 
 
-def test_proxy_returns_502_when_upstream_down(client):
-    resp = client.post("/v1/messages", json={"model": "test"})
-    assert resp.status_code == 502
+def test_proxy_returns_502_when_upstream_down():
+    """Proxy returns 502 when connection to upstream service fails."""
+    import manifold.gateway as gw_mod
+
+    pipeline = _make_pipeline()
+    gw = GatewayConfig()
+    app = create_app(
+        pipeline=pipeline,
+        gateway_config=gw,
+        get_entry_url=lambda: "http://127.0.0.1:7001",
+    )
+
+    with TestClient(app) as c:
+        # _http_client was created during lifespan startup.  Replace its
+        # send() method with a mock that raises ConnectError so the proxy
+        # behaves as if the upstream is unreachable.
+        orig_client = gw_mod._http_client
+        mock_send = AsyncMock(side_effect=httpx.ConnectError("Connection refused"))
+        orig_client.send = mock_send  # type: ignore[method-assign]
+
+        resp = c.post("/v1/messages", json={"model": "test"})
+        assert resp.status_code == 502
+        data = resp.json()
+        assert data["error"]["type"] == "proxy_error"
 
 
 def test_lifespan_closes_http_client():

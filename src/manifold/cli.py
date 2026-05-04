@@ -97,6 +97,56 @@ def _setup_logging(verbose: bool) -> None:
     )
 
 
+def _preflight_check(cfg) -> list[str]:
+    """Validate the loaded config and environment before starting anything.
+
+    Returns a list of non-fatal warnings.  Raises :exc:`typer.Exit` on
+    hard failures so the pipeline never starts in a broken state.
+    """
+    warnings: list[str] = []
+
+    # --- directories -------------------------------------------------------
+    for svc in cfg.pipeline:
+        if not svc.enabled:
+            continue
+        d = Path(svc.directory)
+        if not d.is_dir():
+            warnings.append(
+                f"Service '{svc.name}': directory does not exist: {d}"
+            )
+        elif svc.upstream_via == UpstreamVia.CONFIG_FILE and svc.config_file:
+            cf = d / svc.config_file
+            if not cf.is_file():
+                warnings.append(
+                    f"Service '{svc.name}': config file not found: {cf}"
+                )
+
+    # --- port collisions ---------------------------------------------------
+    service_ports = {s.name: s.port for s in cfg.pipeline if s.enabled}
+    collisions = paths.check_port_collisions(
+        cfg.gateway.port, service_ports, cfg.gateway.host
+    )
+    if collisions:
+        for msg in collisions:
+            log.error(msg)
+        enabled_count = len(service_ports)
+        suggested = cfg.gateway.port + enabled_count + 1
+        log.error(
+            "Port collision detected — try --port %d or higher to avoid conflicts",
+            suggested,
+        )
+        raise typer.Exit(1)
+
+    # --- startup health sanity ---------------------------------------------
+    if cfg.gateway.startup_health_poll_interval > cfg.gateway.startup_health_timeout:
+        raise typer.Exit(
+            f"startup_health_poll_interval ({cfg.gateway.startup_health_poll_interval}s)"
+            f" must be <= startup_health_timeout ({cfg.gateway.startup_health_timeout}s)"
+        )
+
+    return warnings
+
+
 async def _run_pipeline(
     config_path: str | None, verbose: bool, port_override: int | None = None
 ) -> None:
@@ -125,21 +175,18 @@ async def _run_pipeline(
     elif port_override is not None:
         pass  # --port matches config, no offset needed
 
-    # Check for port collisions before starting anything
-    service_ports = {s.name: s.port for s in cfg.pipeline if s.enabled}
-    collisions = paths.check_port_collisions(
-        cfg.gateway.port, service_ports, cfg.gateway.host
+    # Pre-flight validation — catch misconfiguration before starting any
+    # subprocess so the user sees a clear error instead of a cryptic 502.
+    log.info("Validating configuration...")
+    warnings = _preflight_check(cfg)
+    for w in warnings:
+        log.warning(w)
+    enabled = [s.name for s in cfg.pipeline if s.enabled]
+    log.info(
+        "Config valid: %d service(s) enabled (%s)",
+        len(enabled),
+        ", ".join(enabled),
     )
-    if collisions:
-        for msg in collisions:
-            log.error(msg)
-        enabled_count = len(service_ports)
-        suggested = cfg.gateway.port + enabled_count + 1
-        log.error(
-            "Port collision detected — try --port %d or higher to avoid conflicts",
-            suggested,
-        )
-        raise typer.Exit(1)
 
     pipeline = PipelineState(
         services=[ServiceState(config=svc) for svc in cfg.pipeline]
@@ -168,8 +215,12 @@ async def _run_pipeline(
             await asyncio.sleep(delay)
             if state.status == ServiceStatus.STOPPED:
                 return  # user explicitly stopped it
-            # Re-compute correct upstream and patch config before restarting
-            upstreams = compute_upstreams(cfg.pipeline, cfg.gateway.fallback_upstream)
+            # Re-compute correct upstream from the *current* pipeline state,
+            # not the original config (which may be stale after hot-reload).
+            current_services = [s.config for s in pipeline.services]
+            upstreams = compute_upstreams(
+                current_services, cfg.gateway.fallback_upstream
+            )
             upstream_url = upstreams.get(name, cfg.gateway.fallback_upstream)
             svc = state.config
             if svc.upstream_via == UpstreamVia.CONFIG_FILE:
@@ -178,7 +229,7 @@ async def _run_pipeline(
             await start_service(state, upstream_url)
             _restart_delays.pop(name, None)
 
-        asyncio.ensure_future(_do_restart())
+        asyncio.create_task(_do_restart())
 
     set_on_crash(_handle_crash)
 

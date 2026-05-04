@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 
 import httpx
@@ -20,9 +21,9 @@ _pipeline: PipelineState | None = None
 _gateway_config: GatewayConfig | None = None
 _http_client: httpx.AsyncClient | None = None
 # Callbacks injected by the orchestrator
-_get_entry_url: callable = None
-_get_stats: callable = None
-_get_health: callable = None
+_get_entry_url: Callable[[], str | None] | None = None
+_get_stats: Callable[[], dict] | None = None
+_get_health: Callable[[], dict] | None = None
 
 
 def _target_url() -> str | None:
@@ -218,9 +219,9 @@ async def _manifold_config(request: Request) -> JSONResponse:
 def create_app(
     pipeline: PipelineState,
     gateway_config: GatewayConfig,
-    get_entry_url: callable | None = None,
-    get_stats: callable | None = None,
-    get_health: callable | None = None,
+    get_entry_url: Callable[[], str | None] | None = None,
+    get_stats: Callable[[], dict] | None = None,
+    get_health: Callable[[], dict] | None = None,
 ) -> Starlette:
     """Create the Starlette ASGI gateway application."""
     global _pipeline, _gateway_config, _http_client
