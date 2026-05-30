@@ -60,13 +60,23 @@ async def _proxy(request: Request) -> Response:
     headers.pop("transfer-encoding", None)
     headers.pop("content-length", None)
 
-    # Normalize auth: if client sends Authorization Bearer but not x-api-key,
-    # extract the token and set x-api-key so downstream services and the
-    # Anthropic API (which only checks x-api-key) can authenticate.
+    # Auth normalization.  Anthropic accepts two different auth methods,
+    # and they are NOT interchangeable:
+    #
+    #   * Console API keys (``sk-ant-api…``) → ``x-api-key`` header.
+    #   * OAuth access tokens (``sk-ant-oat…``, used by Claude Code) →
+    #     ``Authorization: Bearer`` header.
+    #
+    # If we blindly copy a Bearer token into ``x-api-key``, Anthropic
+    # returns 401 for OAuth tokens.  So: leave ``Authorization`` alone,
+    # and only mirror it into ``x-api-key`` when the token is clearly a
+    # console API key.
     if "x-api-key" not in headers:
         auth = headers.get("authorization", "")
         if auth.lower().startswith("bearer "):
-            headers["x-api-key"] = auth[7:]
+            token = auth[7:]
+            if not token.startswith("sk-ant-oat"):
+                headers["x-api-key"] = token
 
     # Stream the request body to avoid buffering large payloads in memory
     body = request.stream()
