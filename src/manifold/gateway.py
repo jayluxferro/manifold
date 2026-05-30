@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 
@@ -15,6 +16,31 @@ from starlette.routing import Route
 from manifold.models import GatewayConfig, PipelineState
 
 log = logging.getLogger(__name__)
+
+# Set MANIFOLD_DEBUG_HEADERS=1 to log inbound + outbound headers (with bearer
+# tokens / x-api-key truncated).  Useful for diagnosing auth or beta-header
+# stripping problems in the chain.
+_DEBUG_HEADERS = os.environ.get("MANIFOLD_DEBUG_HEADERS") == "1"
+
+
+def _redact_secret(value: str, keep: int = 12) -> str:
+    if len(value) <= keep:
+        return value
+    return f"{value[:keep]}…<{len(value) - keep} more chars>"
+
+
+def _sanitize_headers(headers: dict[str, str]) -> dict[str, str]:
+    """Return a copy of headers with secret values truncated for logging."""
+    out: dict[str, str] = {}
+    for k, v in headers.items():
+        lk = k.lower()
+        if lk == "authorization" and v.lower().startswith("bearer "):
+            out[k] = f"Bearer {_redact_secret(v[7:])}"
+        elif lk in ("x-api-key", "api-key", "cookie", "set-cookie"):
+            out[k] = _redact_secret(v)
+        else:
+            out[k] = v
+    return out
 
 # Module-level state set by create_app
 _pipeline: PipelineState | None = None
@@ -82,6 +108,19 @@ async def _proxy(request: Request) -> Response:
     body = request.stream()
 
     log.debug("Proxying %s %s → %s", request.method, request.url.path, url)
+    if _DEBUG_HEADERS:
+        log.warning(
+            "MANIFOLD_DEBUG_HEADERS inbound %s %s%s headers=%s",
+            request.method,
+            request.url.path,
+            f"?{request.url.query}" if request.url.query else "",
+            _sanitize_headers(dict(request.headers)),
+        )
+        log.warning(
+            "MANIFOLD_DEBUG_HEADERS outbound → %s headers=%s",
+            url,
+            _sanitize_headers(headers),
+        )
 
     try:
         upstream_req = _http_client.build_request(
