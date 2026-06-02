@@ -103,7 +103,9 @@ def _install_capture_transport():
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured["headers"] = dict(request.headers)
-        return httpx.Response(200, content=b"{}", headers={"content-type": "application/json"})
+        return httpx.Response(
+            200, content=b"{}", headers={"content-type": "application/json"}
+        )
 
     transport = httpx.MockTransport(handler)
     gw_mod._http_client = httpx.AsyncClient(transport=transport)

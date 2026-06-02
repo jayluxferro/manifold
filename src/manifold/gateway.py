@@ -42,6 +42,7 @@ def _sanitize_headers(headers: dict[str, str]) -> dict[str, str]:
             out[k] = v
     return out
 
+
 # Module-level state set by create_app
 _pipeline: PipelineState | None = None
 _gateway_config: GatewayConfig | None = None
