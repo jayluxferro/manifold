@@ -1,30 +1,59 @@
 #!/usr/bin/env bash
-# Kill any process bound to a port listed in manifold.yaml.
-# Defaults to ./manifold.yaml; override with MANIFOLD_CONFIG env var or first arg.
+# Kill any process bound to ports used by a manifold pipeline.
+#
+# Copy-paste the args you passed to `manifold up` and it works:
+#   ./scripts/kill-ports.sh --config manifold-anthropic-new.yaml --port 12345
+#   ./scripts/kill-ports.sh -c manifold.yaml
+#   ./scripts/kill-ports.sh manifold-anthropic-new.yaml --port 9000
 set -euo pipefail
 
-CONFIG="${1:-${MANIFOLD_CONFIG:-manifold.yaml}}"
+CONFIG="manifold.yaml"
+GW_PORT=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -c|--config)
+            CONFIG="$2"; shift 2 ;;
+        --config=*)
+            CONFIG="${1#*=}"; shift ;;
+        -p|--port)
+            GW_PORT="$2"; shift 2 ;;
+        --port=*)
+            GW_PORT="${1#*=}"; shift ;;
+        -*) shift ;;  # skip other flags we don't care about
+        *)
+            # positional arg → config file (if it exists)
+            if [ -f "$1" ]; then
+                CONFIG="$1"
+            fi
+            shift ;;
+    esac
+done
 
 if [ ! -f "$CONFIG" ]; then
     echo "Config not found: $CONFIG" >&2
     exit 1
 fi
 
-# Extract all port numbers (gateway + pipeline) using Python (pyyaml is
-# already in the project's uv environment).
+# Extract pipeline service ports from config; apply --port override for gateway.
 ports=$(uv run python -c "
 import yaml, sys
 with open('$CONFIG') as f:
     cfg = yaml.safe_load(f) or {}
-gw = (cfg.get('gateway') or {}).get('port')
-ports = []
-if gw:
-    ports.append(int(gw))
+
+gw_port = ${GW_PORT:-None}
+if gw_port is None:
+    gw = (cfg.get('gateway') or {})
+    gw_port = gw.get('port')
+
+result = []
+if gw_port is not None:
+    result.append(int(gw_port))
 for svc in cfg.get('pipeline') or []:
     p = svc.get('port')
     if p is not None:
-        ports.append(int(p))
-print(' '.join(str(p) for p in ports))
+        result.append(int(p))
+print(' '.join(str(p) for p in result))
 ")
 
 if [ -z "$ports" ]; then
@@ -32,7 +61,11 @@ if [ -z "$ports" ]; then
     exit 0
 fi
 
-echo "Ports from $CONFIG: $ports"
+echo "Config:  $CONFIG"
+if [ -n "$GW_PORT" ]; then
+    echo "Gateway:  port $GW_PORT (CLI override)"
+fi
+echo "Ports:   $ports"
 echo
 
 killed=0
@@ -50,7 +83,7 @@ for port in $ports; do
     done
 done
 
-# Give processes a moment to die, then force-kill survivors
+# Grace period, then force-kill survivors
 if [ "$killed" -gt 0 ]; then
     sleep 0.5
     for port in $ports; do
