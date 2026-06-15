@@ -24,7 +24,11 @@ from manifold.models import (
 
 
 def _svc(
-    name: str, port: int, enabled: bool = True, via: UpstreamVia = UpstreamVia.CLI_ARG
+    name: str,
+    port: int,
+    enabled: bool = True,
+    via: UpstreamVia = UpstreamVia.CLI_ARG,
+    upstream_path: str = "",
 ) -> ServiceConfig:
     return ServiceConfig(
         name=name,
@@ -34,6 +38,7 @@ def _svc(
         health="/h",
         upstream_via=via,
         enabled=enabled,
+        upstream_path=upstream_path,
     )
 
 
@@ -74,6 +79,34 @@ class TestComputeUpstreams:
             "b": "http://127.0.0.1:7003",
             "c": "https://api.anthropic.com",
         }
+
+    def test_upstream_path_on_mid_service(self):
+        """upstream_path is appended to the next-service URL for mid-chain services."""
+        services = [
+            _svc("a", 7001, upstream_path="/v1"),
+            _svc("b", 7002),
+            _svc("c", 7003),
+        ]
+        result = compute_upstreams(services, "https://api.anthropic.com")
+        assert result["a"] == "http://127.0.0.1:7002/v1"
+        assert result["b"] == "http://127.0.0.1:7003"
+        assert result["c"] == "https://api.anthropic.com"
+
+    def test_upstream_path_on_last_service(self):
+        """upstream_path is appended to fallback_upstream for the last service."""
+        services = [
+            _svc("a", 7001),
+            _svc("b", 7002, upstream_path="/v1"),
+        ]
+        result = compute_upstreams(services, "https://api.example.com")
+        assert result["a"] == "http://127.0.0.1:7002"
+        assert result["b"] == "https://api.example.com/v1"
+
+    def test_upstream_path_only_service(self):
+        """A single service with upstream_path appends to fallback_upstream."""
+        services = [_svc("only", 7001, upstream_path="/v1")]
+        result = compute_upstreams(services, "https://api.example.com")
+        assert result["only"] == "https://api.example.com/v1"
 
     def test_disabled_skipped(self):
         services = [

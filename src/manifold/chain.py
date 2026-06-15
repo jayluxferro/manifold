@@ -69,7 +69,11 @@ def compute_upstreams(
                 f"{base}{svc.upstream_path}" if svc.upstream_path else base
             )
         else:
-            upstreams[svc.name] = fallback_upstream
+            upstreams[svc.name] = (
+                f"{fallback_upstream}{svc.upstream_path}"
+                if svc.upstream_path
+                else fallback_upstream
+            )
     return upstreams
 
 
