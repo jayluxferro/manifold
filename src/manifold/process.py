@@ -109,7 +109,9 @@ async def _stream_output(
         if not line:
             break
         text = line.decode("utf-8", errors="replace").rstrip()
-        log.info("[%s/%s] %s", name, label, text)
+        # service_name lets the console formatter color the line per service;
+        # the file logger below never sees ANSI codes.
+        log.info("[%s/%s] %s", name, label, text, extra={"service_name": name})
         if svc_logger:
             svc_logger.info("[%s] %s", label, text)
 

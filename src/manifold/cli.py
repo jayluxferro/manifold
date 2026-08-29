@@ -23,6 +23,7 @@ from manifold.chain import (
 from manifold.config import ConfigError, find_config, load_config
 from manifold import paths
 from manifold.gateway import create_app
+from manifold.logs import ServiceColorFormatter, console_supports_color
 from manifold.health import (
     health_loop,
     wait_for_services_ready,
@@ -90,11 +91,15 @@ def _maybe_prompt_gateway_startup_health(raw: dict) -> None:
 
 def _setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        ServiceColorFormatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%H:%M:%S",
+            use_color=console_supports_color(),
+        )
     )
+    logging.basicConfig(level=level, handlers=[handler])
 
 
 def _preflight_check(cfg) -> list[str]:

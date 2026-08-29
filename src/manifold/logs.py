@@ -3,9 +3,62 @@
 from __future__ import annotations
 
 import logging
+import os
+import sys
 from pathlib import Path
 
 LOG_DIR = Path.home() / ".manifold" / "logs"
+
+_RESET = "\x1b[0m"
+
+# 256-color palette chosen for visual distinctness on dark terminals.  Colors
+# are assigned in registration order (which is pipeline order, since services
+# log their first line when started sequentially), cycling if a config ever
+# has more services than colors.  Per-process by design: each manifold
+# instance has its own console, so cross-instance consistency is unnecessary.
+_SERVICE_PALETTE = (51, 82, 207, 75, 220, 168, 149, 147, 189, 121)
+_service_colors: dict[str, int] = {}
+
+
+def service_color(name: str) -> str:
+    """Return the ANSI 256-color escape assigned to a service (stable per name)."""
+    if name not in _service_colors:
+        _service_colors[name] = _SERVICE_PALETTE[
+            len(_service_colors) % len(_SERVICE_PALETTE)
+        ]
+    return f"\x1b[38;5;{_service_colors[name]}m"
+
+
+def console_supports_color(stream=None) -> bool:
+    """Color only on a real terminal; NO_COLOR (https://no-color.org) opts out.
+
+    Defaults to stderr because logging.StreamHandler writes there.
+    """
+    stream = stream if stream is not None else sys.stderr
+    return (
+        hasattr(stream, "isatty") and stream.isatty() and not os.environ.get("NO_COLOR")
+    )
+
+
+class ServiceColorFormatter(logging.Formatter):
+    """Color the whole console line in the originating service's color.
+
+    Records relayed from service subprocesses carry ``extra={"service_name": ...}``
+    (see process._stream_output); manifold's own lines have no service_name and
+    stay in the default color, which keeps the control plane visually distinct
+    from the pipeline layers.
+    """
+
+    def __init__(self, *args, use_color: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.use_color = use_color
+
+    def format(self, record: logging.LogRecord) -> str:
+        text = super().format(record)
+        name = getattr(record, "service_name", None)
+        if self.use_color and name:
+            return f"{service_color(name)}{text}{_RESET}"
+        return text
 
 
 def setup_service_log(name: str) -> logging.Logger:
