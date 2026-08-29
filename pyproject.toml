@@ -5,7 +5,7 @@ description = "Proxy mesh gateway — chain multiple LLM proxy services into a s
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "httpx>=0.27",
+    "httpx>=0.28.1",
     "pyyaml>=6.0",
     "typer>=0.12",
     "uvicorn>=0.30",
