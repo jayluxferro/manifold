@@ -33,3 +33,4 @@ manifold-*.yaml
 
 # Misc
 git-push
+*.yaml.bak
