@@ -132,7 +132,11 @@ async def _proxy(request: Request) -> Response:
         )
         upstream_resp = await _http_client.send(upstream_req, stream=True)
     except (httpx.ConnectError, httpx.TransportError) as exc:
-        log.error("Upstream connect error: %s", exc)
+        # str(exc) is EMPTY for several transport exceptions (ReadError
+        # wrapping anyio.EndOfStream, ConnectTimeout) — always prefix the
+        # type and name the target or the log line is a bare colon.
+        detail = f"{type(exc).__name__}: {exc}".rstrip(": ")
+        log.error("Upstream connect error to %s: %s", url, detail)
         return JSONResponse(
             {
                 "error": {

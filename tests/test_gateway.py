@@ -132,6 +132,36 @@ def test_proxy_returns_502_when_upstream_down():
         assert data["error"]["type"] == "proxy_error"
 
 
+def test_proxy_empty_str_connect_error_is_typed_in_log(caplog):
+    """Regression: transport exceptions often have an EMPTY str() — the log
+    line must still name the type AND the target URL, not end at the colon."""
+    import logging
+
+    import manifold.gateway as gw_mod
+
+    pipeline = _make_pipeline()
+    gw = GatewayConfig()
+    app = create_app(
+        pipeline=pipeline,
+        gateway_config=gw,
+        get_entry_url=lambda: "http://127.0.0.1:7001",
+    )
+
+    with TestClient(app) as c:
+        orig_client = gw_mod._http_client
+        mock_send = AsyncMock(side_effect=httpx.ConnectError(""))
+        orig_client.send = mock_send  # type: ignore[method-assign]
+
+        with caplog.at_level(logging.ERROR, logger="manifold.gateway"):
+            resp = c.post("/v1/messages", json={"model": "test"})
+        assert resp.status_code == 502
+
+    assert any(
+        "ConnectError" in r.getMessage() and "7001" in r.getMessage()
+        for r in caplog.records
+    )
+
+
 def _install_capture_transport():
     """Replace the gateway's httpx client with a MockTransport that captures requests."""
     import manifold.gateway as gw_mod
