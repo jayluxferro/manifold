@@ -70,6 +70,12 @@ class ServiceState:
     pid: int | None = None
     upstream_url: str | None = None
     consecutive_failures: int = 0
+    # Registry fields (see registry.py): adopted services are owned by another
+    # gateway and must never be killed by this one (I1).
+    adopted: bool = False
+    pgid: int | None = None
+    identity: str | None = None
+    owner_port: int | None = None
 
 
 @dataclass

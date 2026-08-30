@@ -138,12 +138,34 @@ Manifold supports two ways to set a service's upstream:
 
 The **last** service in the pipeline keeps its own upstream unchanged — manifold doesn't touch it.
 
+## Shared Services
+
+A second `manifold up` on the **same config** (e.g. `manifold up --port 9001`
+while one is running on `:9000`) no longer spawns a duplicate chain. When the
+service wiring — name, directory, command, port, and upstream — matches a
+running service exactly, the new gateway **adopts** it: it reuses the existing
+process and only proxies through it. This is tracked in a local registry under
+`~/.manifold/run/` (see docs/ARCHITECTURE.md → "Service Registry & Leases").
+
+- **Adoption is wiring-exact.** Any difference in name/directory/command/port/
+  upstream means a separate process set, not sharing.
+- **Stop on last leave.** Services stay running while any gateway still uses
+  them; when the **last** gateway leaves, its processes are stopped and their
+  ports freed. No warm pool.
+- **Teardown is registry-backed.** `manifold down --port <port>` reaps
+  services directly from the registry even when the gateway process is dead or
+  hung, then transfers ownership to any surviving gateways that still lease
+  them.
+
 ## CLI
 
 ```bash
 manifold up              # Start all services + gateway (foreground)
 manifold up -v           # Verbose mode with debug logging
+manifold up --isolated   # Full duplicate chain (old delta-offset behavior)
 manifold down            # Stop a running manifold instance (via PID file)
+manifold down --port 9001     # Stop the instance on a specific gateway port
+manifold down --all            # Stop every running manifold instance
 manifold status          # Show pipeline config and computed chain topology
 manifold stats           # Fetch live stats from running gateway
 manifold validate        # Validate manifold.yaml without starting anything
@@ -153,6 +175,20 @@ manifold add             # Interactively register a new service into the pipelin
 ### Options
 
 All commands accept `--config / -c` to specify a config file path (defaults to `./manifold.yaml`).
+
+**`manifold up --port`** — the semantics changed deliberately: in shared mode
+`--port` overrides **only the gateway port**. Service ports are **no longer
+delta-offset**; the second gateway adopts the already-running services instead
+of spawning duplicates. Use **`--isolated`** if you need the old behavior
+(gateway *and* every service port shifted by the same delta, spawning a full
+second chain) — isolated instances are still registry-tracked, so `down`
+cleans them reliably.
+
+**`manifold down`** — accepts `--port <port>` (teardown a specific gateway
+port; needed when multiple instances run), `--all` (teardown every discovered
+instance), and `--config <path>` (feeds the legacy lsof fallback for
+pre-registry instances). `down` reaps services through the registry even if
+the gateway process is dead, so ports are freed without a live signal handler.
 
 ## Development
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 
 import httpx
 
@@ -89,10 +90,15 @@ async def run_health_checks(
     pipeline: PipelineState,
     gateway: GatewayConfig,
     client: httpx.AsyncClient,
+    on_adopted_unhealthy: Callable[[ServiceState], Awaitable[None]] | None = None,
 ) -> bool:
     """Run one round of health checks on all enabled services.
 
     Returns True if any service changed state (chain may need rewiring).
+
+    ``on_adopted_unhealthy`` fires once when an adopted service flips
+    HEALTHY -> UNHEALTHY (3 consecutive failures), letting the orchestrator
+    try to reclaim the service from its dead owner.
     """
     changed = False
 
@@ -123,6 +129,8 @@ async def run_health_checks(
                 )
                 state.status = ServiceStatus.UNHEALTHY
                 changed = True
+                if state.adopted and on_adopted_unhealthy is not None:
+                    await on_adopted_unhealthy(state)
 
     if changed:
         rewire_around(pipeline, gateway)
@@ -135,6 +143,7 @@ async def health_loop(
     gateway: GatewayConfig,
     interval: float = DEFAULT_INTERVAL,
     stop_event: asyncio.Event | None = None,
+    on_adopted_unhealthy: Callable[[ServiceState], Awaitable[None]] | None = None,
 ) -> None:
     """Background loop that checks service health and rewires the chain."""
     async with httpx.AsyncClient() as client:
@@ -142,7 +151,12 @@ async def health_loop(
             if stop_event and stop_event.is_set():
                 break
             try:
-                await run_health_checks(pipeline, gateway, client)
+                await run_health_checks(
+                    pipeline,
+                    gateway,
+                    client,
+                    on_adopted_unhealthy=on_adopted_unhealthy,
+                )
             except Exception:
                 log.exception("Health check loop error")
             try:

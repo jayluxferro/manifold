@@ -253,6 +253,11 @@ async def _manifold_config(request: Request) -> JSONResponse:
                 "status": s.status.value,
                 "upstream": s.upstream_url,
                 "pid": s.pid,
+                # Registry fields: adopted services are shared with another
+                # gateway (I1 — this one must never kill or restart them);
+                # owner_port is the gateway port that owns the processes.
+                "adopted": s.adopted,
+                "owner_port": s.owner_port,
             }
         )
     return JSONResponse(

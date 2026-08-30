@@ -210,6 +210,73 @@ Hits each service's stats endpoint concurrently (asyncio.gather), merges into:
 
 No schema normalization — each service's stats are included as-is.
 
+### 7. Service Registry & Leases (`registry.py`)
+
+Manifold runs a small filesystem registry so multiple gateways can **share**
+one set of service processes instead of each spawning a full duplicate chain.
+State lives under `~/.manifold/run/` (derived lazily at call time from
+`paths.PID_DIR`, so tests keep patching `manifold.paths.PID_DIR`):
+
+```
+~/.manifold/run/
+  services/<identity>.json     # one per running service; exactly one owning gateway
+  leases/gateway-<port>.json   # one per running gateway; identities it uses
+  locks/<identity>.lock        # O_EXCL spawn lock; content = locking pid (debug)
+```
+
+**Identity computation.** A service entry is keyed by a canonical identity:
+`sha256(json.dumps([name, directory, port, upstream_url,
+resolve_command(svc, upstream_url)]))` with compact separators. `upstream_url`
+includes `upstream_path` (already applied by `compute_upstreams`); health and
+stats paths are deliberately excluded. Two gateways share a service iff their
+computed identities are byte-identical.
+
+**Entry / lease shape.**
+- Service entry: `{schema_version, identity, name, directory, command
+  (resolved), port, upstream, pid, pgid, owner_port, owner_pid, started_at}`.
+- Lease: `{schema_version, gateway_port, gateway_pid, isolated, identities[],
+  updated_at}`.
+
+**Ownership & lease semantics** (invariants I1–I7, see SPEC-shared-pipeline.md):
+- **I1 single writer** — only the entry's `owner_port` gateway may
+  spawn/kill/restart/patch a service. Adopters are read-only: they never
+  spawn, patch, forward logs, killpg, or restart.
+- **I3 kill authority** — `owner_port`/`owner_pid` authorize kills; a lease
+  identity list alone never authorizes killing a service another live lease
+  still lists.
+- **I4 verified kill** — killpg only when `os.getpgid(entry["pid"]) ==
+  entry["pgid"]` (guards pid/pgid reuse); on mismatch the entry is removed but
+  the process is left alone.
+- **I6 sharing boundary** — adoption only on exact identity match.
+- **I7 stop on last leave** — services stop when their last leasing gateway
+  leaves; no warm pool.
+
+**Adoption flow.** On `manifold up` (shared mode), each service is planned as
+ADOPT / PROMOTE / SPAWN / ERROR. A live entry with a live owner → **adopt**
+(reuse the process, set `adopted=True`, record `owner_port`); live entry with
+dead owner → **promote** (kill the orphaned process set per I4, then spawn as
+owner); no entry → **spawn** (port must be free in shared mode, else a hard
+error naming the conflicting identity). Spawns serialize on an O_EXCL
+`locks/<identity>.lock`; a concurrent up waiting on the lock re-adopts if an
+entry appears. The gateway writes its **lease before the first spawn** so a
+`down` racing `up` sees the intended ownership, then refreshes it after the
+plan loop. `--isolated` skips adoption entirely: it spawns a full
+delta-offset duplicate chain (old behavior), still registry-tracked.
+
+**Teardown.** `manifold down --port <port>` snapshots the lease and legacy pid
+file first, signals the gateway (SIGTERM → poll → SIGKILL), then reaps
+directly from the registry: each snapshotted identity is either transferred to
+a surviving live lease holder (handoff, no kill) or killed via
+`kill_entry_processes`; an owner-port sweep catches crash-mid-startup orphans.
+Finally it removes the lease, pid file, and port file. Pre-registry instances
+(pid file only, no lease) fall back to the legacy lsof port scan inside
+`manifold down` (needs `--config`). `down --all` runs this over every
+discovered port, then `sweep_stale()` cleans dead entries, orphaned services,
+and dead leases. The health monitor additionally fires an
+`on_adopted_unhealthy` callback when an adopted service flips
+HEALTHY→UNHEALTHY so the owning gateway can be prompted to recover it — an
+adopter never touches the process itself.
+
 ## Data Flow
 
 ### Normal Operation

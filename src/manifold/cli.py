@@ -7,6 +7,8 @@ import json
 import logging
 import os
 import signal
+import subprocess
+import time
 from pathlib import Path
 
 import httpx
@@ -14,14 +16,16 @@ import typer
 import uvicorn
 import yaml
 
+from manifold import paths, process, registry
+from manifold import service_ops
 from manifold.chain import (
     compute_upstreams,
     get_entry_url,
     patch_service_config,
-    wire_pipeline,
+    resolve_command,
+    rewire_around,
 )
 from manifold.config import ConfigError, find_config, load_config
-from manifold import paths
 from manifold.gateway import create_app
 from manifold.logs import ServiceColorFormatter, console_supports_color
 from manifold.health import (
@@ -31,12 +35,6 @@ from manifold.health import (
 )
 from manifold.watcher import watch_config
 from manifold.models import PipelineState, ServiceState, ServiceStatus, UpstreamVia
-from manifold.process import (
-    set_on_crash,
-    start_service,
-    stop_all,
-    sync_kill_tracked_subprocesses,
-)
 from manifold.stats import aggregate_stats
 
 app = typer.Typer(
@@ -102,11 +100,45 @@ def _setup_logging(verbose: bool) -> None:
     logging.basicConfig(level=level, handlers=[handler])
 
 
-def _preflight_check(cfg) -> list[str]:
+def _apply_port_override(
+    cfg, port_override: int | None, isolated: bool = False
+) -> None:
+    """Shift ports when ``--port`` is given.
+
+    Shared mode: only the gateway port moves — services are shared by
+    identity with other instances, so their ports must stay put.  Isolated
+    mode restores the legacy delta-offset: the gateway AND every service
+    port shift by the same delta so this instance owns a private copy of
+    the whole chain.
+    """
+    if port_override is None or port_override == cfg.gateway.port:
+        return
+    delta = port_override - cfg.gateway.port
+    log.info(
+        "Port override: gateway %d → %d (delta %+d)%s",
+        cfg.gateway.port,
+        port_override,
+        delta,
+        " — isolated: service ports offset too"
+        if isolated
+        else " — shared: gateway only",
+    )
+    cfg.gateway.port = port_override
+    if isolated:
+        for svc in cfg.pipeline:
+            svc.port = svc.port + delta
+
+
+def _preflight_check(cfg, shared: bool = False) -> list[str]:
     """Validate the loaded config and environment before starting anything.
 
     Returns a list of non-fatal warnings.  Raises :exc:`typer.Exit` on
     hard failures so the pipeline never starts in a broken state.
+
+    In *shared* mode a service port that is already in use is only an error
+    when no live registry entry with the matching identity exists — the same
+    wiring may be adopted (I6); a different wiring is a hard collision.  The
+    gateway port is a hard error in both modes.
     """
     warnings: list[str] = []
 
@@ -123,20 +155,54 @@ def _preflight_check(cfg) -> list[str]:
                 warnings.append(f"Service '{svc.name}': config file not found: {cf}")
 
     # --- port collisions ---------------------------------------------------
-    service_ports = {s.name: s.port for s in cfg.pipeline if s.enabled}
-    collisions = paths.check_port_collisions(
-        cfg.gateway.port, service_ports, cfg.gateway.host
-    )
-    if collisions:
-        for msg in collisions:
-            log.error(msg)
-        enabled_count = len(service_ports)
-        suggested = cfg.gateway.port + enabled_count + 1
-        log.error(
-            "Port collision detected — try --port %d or higher to avoid conflicts",
-            suggested,
-        )
+    if paths.is_port_in_use(cfg.gateway.port, cfg.gateway.host):
+        log.error("Gateway port %d is already in use", cfg.gateway.port)
         raise typer.Exit(1)
+
+    if shared:
+        upstreams = compute_upstreams(cfg.pipeline, cfg.gateway.fallback_upstream)
+        for svc in cfg.pipeline:
+            if not svc.enabled:
+                continue
+            if not paths.is_port_in_use(svc.port):
+                continue
+            identity = registry.compute_service_identity(
+                svc, upstreams.get(svc.name, cfg.gateway.fallback_upstream)
+            )
+            entry = registry.read_service_entry(identity)
+            # Same rule as _plan_service: a running service process with the
+            # identical wiring is adoptable (or promotable if its owner died).
+            if entry is not None and registry.pid_alive(entry.get("pid")):
+                continue  # identical wiring already running — adoption OK (I6)
+            conflict = registry.find_live_entry_by_port(svc.port)
+            if conflict is not None:
+                owner = f"owner gateway :{conflict.get('owner_port')}"
+            else:
+                owner = "non-manifold process"
+            log.error(
+                "Port %d for service '%s' is already in use by a different wiring "
+                "(identity %s…, %s)",
+                svc.port,
+                svc.name,
+                identity[:12],
+                owner,
+            )
+            raise typer.Exit(1)
+    else:
+        service_ports = {s.name: s.port for s in cfg.pipeline if s.enabled}
+        collisions = paths.check_port_collisions(
+            cfg.gateway.port, service_ports, cfg.gateway.host
+        )
+        if collisions:
+            for msg in collisions:
+                log.error(msg)
+            enabled_count = len(service_ports)
+            suggested = cfg.gateway.port + enabled_count + 1
+            log.error(
+                "Port collision detected — try --port %d or higher to avoid conflicts",
+                suggested,
+            )
+            raise typer.Exit(1)
 
     # --- startup health sanity ---------------------------------------------
     if cfg.gateway.startup_health_poll_interval > cfg.gateway.startup_health_timeout:
@@ -149,7 +215,10 @@ def _preflight_check(cfg) -> list[str]:
 
 
 async def _run_pipeline(
-    config_path: str | None, verbose: bool, port_override: int | None = None
+    config_path: str | None,
+    verbose: bool,
+    port_override: int | None = None,
+    isolated: bool = False,
 ) -> None:
     """Core async logic for 'manifold up'."""
     _setup_logging(verbose)
@@ -161,25 +230,18 @@ async def _run_pipeline(
         log.error("Configuration error: %s", exc)
         raise typer.Exit(1)
 
-    # Apply port offset when --port is given
-    if port_override is not None and port_override != cfg.gateway.port:
-        delta = port_override - cfg.gateway.port
-        log.info(
-            "Port override: gateway %d → %d (delta %+d)",
-            cfg.gateway.port,
-            port_override,
-            delta,
-        )
-        cfg.gateway.port = port_override
-        for svc in cfg.pipeline:
-            svc.port = svc.port + delta
-    elif port_override is not None:
-        pass  # --port matches config, no offset needed
+    # Port override: shared mode moves only the gateway port; --isolated
+    # offsets every service port too (legacy full-duplicate behavior).
+    _apply_port_override(cfg, port_override, isolated)
+
+    # Clear orphaned registry state before planning: dead entries, leases of
+    # dead gateways, and orphans whose owner died (I2/I7).
+    registry.sweep_stale()
 
     # Pre-flight validation — catch misconfiguration before starting any
     # subprocess so the user sees a clear error instead of a cryptic 502.
     log.info("Validating configuration...")
-    warnings = _preflight_check(cfg)
+    warnings = _preflight_check(cfg, shared=not isolated)
     for w in warnings:
         log.warning(w)
     enabled = [s.name for s in cfg.pipeline if s.enabled]
@@ -193,14 +255,18 @@ async def _run_pipeline(
         services=[ServiceState(config=svc) for svc in cfg.pipeline]
     )
 
-    # Register crash callback: rewire chain, then schedule auto-restart
-    from manifold.chain import rewire_around
+    gw_port = cfg.gateway.port
+    gw_pid = os.getpid()
 
+    # Register crash callback: rewire chain, then schedule auto-restart
     _restart_delays: dict[str, float] = {}
     _MAX_RESTART_DELAY = 60.0
     _BASE_RESTART_DELAY = 2.0
 
     def _handle_crash(state: ServiceState) -> None:
+        # Adopted services belong to another gateway — never touch them (I1).
+        if state.adopted:
+            return
         name = state.config.name
         log.warning("Service '%s' crashed — rewiring chain to bypass it", name)
         rewire_around(pipeline, cfg.gateway)
@@ -227,48 +293,81 @@ async def _run_pipeline(
             if svc.upstream_via == UpstreamVia.CONFIG_FILE:
                 patch_service_config(svc, upstream_url)
             log.info("Auto-restarting '%s' with upstream %s", name, upstream_url)
-            await start_service(state, upstream_url)
+            await process.start_service(state, upstream_url)
+            # The entry must reflect the fresh pid/pgid so reapers and other
+            # gateways keep seeing a live owner (I2).
+            if state.identity:
+                try:
+                    entry = registry.read_service_entry(state.identity)
+                    if entry is not None:
+                        entry.update(
+                            {
+                                "pid": state.pid,
+                                "pgid": state.pgid,
+                                "command": resolve_command(svc, upstream_url),
+                                "upstream": upstream_url,
+                                "started_at": time.time(),
+                            }
+                        )
+                        registry.write_service_entry(entry)
+                except Exception:
+                    log.exception("Failed to refresh registry entry for '%s'", name)
             _restart_delays.pop(name, None)
 
         asyncio.create_task(_do_restart())
 
-    set_on_crash(_handle_crash)
+    process.set_on_crash(_handle_crash)
 
-    # Wire chain: compute upstreams and patch config files
-    upstreams = wire_pipeline(cfg.pipeline, cfg.gateway)
+    # Compute upstreams.  There is no blanket wire_pipeline here: adopters
+    # must never patch another gateway's configs (I1), and every spawn
+    # patches its own CONFIG_FILE service inside _spawn_owned.
+    upstreams = compute_upstreams(cfg.pipeline, cfg.gateway.fallback_upstream)
 
-    # Start services in order
+    # Plan every enabled service BEFORE spawning anything, so a single
+    # conflict aborts the start with nothing left half-started.
+    plans: list[tuple[ServiceState, str, str, dict | str | None, str]] = []
+    identities: list[str] = []
     for state in pipeline.services:
         if not state.config.enabled:
             log.info("Skipping disabled service: %s", state.config.name)
             continue
         upstream_url = upstreams[state.config.name]
-        await start_service(state, upstream_url)
+        decision, payload = service_ops._plan_service(state.config, upstream_url)
+        if decision == "error":
+            log.error("%s", payload)
+            raise typer.Exit(1)
+        identity = registry.compute_service_identity(state.config, upstream_url)
+        plans.append((state, decision, upstream_url, payload, identity))
+        identities.append(identity)
 
-    try:
-        await wait_for_services_ready(pipeline, cfg.gateway)
-    except StartupHealthTimeoutError as exc:
-        log.error("%s", exc)
-        raise typer.Exit(1)
+    # Write the lease BEFORE the first spawn so a racing `down` knows what
+    # this gateway is about to own (narrows the down-races-up window).
+    registry.write_lease(gw_port, gw_pid, identities, isolated)
 
-    # Health check stop event
+    # Start services in order: adopt running ones, reclaim dead-owner ones,
+    # spawn the rest.
+    for state, decision, upstream_url, payload, identity in plans:
+        if decision == "adopt":
+            service_ops._adopt_from_entry(state, payload, upstream_url)
+        else:
+            await service_ops._spawn_owned(
+                state,
+                upstream_url,
+                identity,
+                gw_port,
+                gw_pid,
+                reclaim_entry=payload if decision == "promote" else None,
+            )
+
+    # The identity set is final now — refresh the lease.
+    registry.write_lease(gw_port, gw_pid, identities, isolated)
+
     stop_event = asyncio.Event()
-
-    # Start background health checks
-    health_task = asyncio.create_task(
-        health_loop(pipeline, cfg.gateway, stop_event=stop_event)
-    )
-
-    # Start config file watcher for hot-reload
-    watcher_task = asyncio.create_task(
-        watch_config(resolved_config_path, pipeline, cfg.gateway, stop_event=stop_event)
-    )
-
-    # Create gateway app with callbacks
-    import httpx as _httpx
+    health_task: asyncio.Task | None = None
+    watcher_task: asyncio.Task | None = None
 
     async def _stats_callback():
-        async with _httpx.AsyncClient() as client:
+        async with httpx.AsyncClient() as client:
             return await aggregate_stats(pipeline, client)
 
     async def _health_callback():
@@ -279,8 +378,16 @@ async def _run_pipeline(
                 "pid": s.pid,
                 "port": s.config.port,
                 "enabled": s.config.enabled,
+                "adopted": s.adopted,
+                "owner_port": s.owner_port,
             }
         return {"services": services, "gateway": "running"}
+
+    async def _on_adopted_unhealthy(state: ServiceState) -> None:
+        """Reclaim an adopted service whose owner gateway died (health hook)."""
+        if await service_ops._promote_adopted(state, gw_port, gw_pid):
+            current = [s.identity for s in pipeline.services if s.identity]
+            registry.write_lease(gw_port, gw_pid, current, isolated)
 
     gateway_app = create_app(
         pipeline=pipeline,
@@ -292,7 +399,6 @@ async def _run_pipeline(
     pipeline.gateway_running = True
 
     # Write per-instance PID + port files for `manifold down` / `manifold stats`
-    gw_port = cfg.gateway.port
     pid_file = paths.pid_file_for(gw_port)
     port_file = paths.port_file_for(gw_port)
     paths.PID_DIR.mkdir(parents=True, exist_ok=True)
@@ -337,13 +443,45 @@ async def _run_pipeline(
             server.should_exit = True
         else:
             log.warning("Forced shutdown — killing all services")
-            sync_kill_tracked_subprocesses()
+            process.sync_kill_tracked_subprocesses()
             os._exit(1)
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _handle_shutdown)
 
+    # The whole runtime sits in a try/finally so that even a startup-health
+    # timeout or a crashed uvicorn tears the registry down (today's leak:
+    # StartupHealthTimeoutError used to orphan spawned services).
     try:
+        try:
+            await wait_for_services_ready(pipeline, cfg.gateway)
+        except StartupHealthTimeoutError as exc:
+            log.error("%s", exc)
+            raise typer.Exit(1)
+
+        # Start background health checks
+        health_task = asyncio.create_task(
+            health_loop(
+                pipeline,
+                cfg.gateway,
+                stop_event=stop_event,
+                on_adopted_unhealthy=_on_adopted_unhealthy,
+            )
+        )
+
+        # Start config file watcher for hot-reload
+        watcher_task = asyncio.create_task(
+            watch_config(
+                resolved_config_path,
+                pipeline,
+                cfg.gateway,
+                stop_event=stop_event,
+                gw_port=gw_port,
+                gw_pid=gw_pid,
+                isolated=isolated,
+            )
+        )
+
         await server.startup()
         if not server.should_exit:
             await server.main_loop()
@@ -351,21 +489,23 @@ async def _run_pipeline(
             await server.shutdown()
     finally:
         stop_event.set()
-        health_task.cancel()
-        watcher_task.cancel()
-        await asyncio.gather(health_task, watcher_task, return_exceptions=True)
+        if health_task is not None:
+            health_task.cancel()
+        if watcher_task is not None:
+            watcher_task.cancel()
+        if health_task is not None or watcher_task is not None:
+            await asyncio.gather(health_task, watcher_task, return_exceptions=True)
 
         if pipeline.gateway_running:
             log.info("Stopping pipeline services...")
-            try:
-                await stop_all(pipeline.services)
-            except Exception:
-                log.exception("Error stopping pipeline services")
-            sync_kill_tracked_subprocesses()
-            pipeline.gateway_running = False
-            pid_file.unlink(missing_ok=True)
-            port_file.unlink(missing_ok=True)
-            log.info("Manifold stopped.")
+        try:
+            await _shutdown_pipeline(pipeline, gw_port, gw_pid)
+        except Exception:
+            log.exception("Error stopping pipeline services")
+        pipeline.gateway_running = False
+        pid_file.unlink(missing_ok=True)
+        port_file.unlink(missing_ok=True)
+        log.info("Manifold stopped.")
 
         # Remove signal handlers — cleanup is done
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -373,6 +513,51 @@ async def _run_pipeline(
                 loop.remove_signal_handler(sig)
             except Exception:
                 pass
+
+
+async def _shutdown_pipeline(
+    pipeline: PipelineState, gw_port: int, gw_pid: int
+) -> None:
+    """Graceful teardown with registry handoff (I7: stop on last leave).
+
+    For each owned service still needed by a live other lease, transfer entry
+    ownership to that lease's gateway and release our tracking (the process
+    keeps running — we just stop being its owner).  Owned services nobody
+    needs anymore are stopped and their entries removed.  Adopted services
+    are never touched (I1).
+    """
+    other_live = registry.live_other_leases(gw_port)
+    still_needed: set[str] = set()
+    holder_of: dict[str, dict] = {}
+    for lease in other_live:
+        for ident in lease.get("identities", []):
+            still_needed.add(ident)
+            holder_of.setdefault(ident, lease)
+
+    for state in reversed(pipeline.services):
+        if state.identity is None:
+            continue
+        if state.adopted:
+            continue  # another gateway owns it — leave it alone (I1)
+        if state.identity in still_needed:
+            holder = holder_of[state.identity]
+            entry = registry.read_service_entry(state.identity)
+            if entry is not None:
+                entry["owner_port"] = holder["gateway_port"]
+                entry["owner_pid"] = holder["gateway_pid"]
+                registry.write_service_entry(entry)
+            await process.release_service(state)
+            log.info(
+                "Handed off '%s' to gateway :%s",
+                state.config.name,
+                holder["gateway_port"],
+            )
+        else:
+            await process.stop_service(state)
+            registry.remove_service_entry(state.identity)
+
+    registry.remove_lease(gw_port)
+    process.sync_kill_tracked_subprocesses()
 
 
 @app.command()
@@ -383,11 +568,19 @@ def up(
         None,
         "--port",
         "-p",
-        help="Override gateway port (service ports auto-offset by the same delta)",
+        help="Override gateway port (shared mode: gateway only — services are shared by identity)",
+    ),
+    isolated: bool = typer.Option(
+        False,
+        "--isolated",
+        help=(
+            "Run a fully independent instance: --port offsets gateway AND "
+            "service ports by the same delta (legacy behavior)"
+        ),
     ),
 ) -> None:
     """Start all services and the gateway."""
-    asyncio.run(_run_pipeline(config, verbose, port_override=port))
+    asyncio.run(_run_pipeline(config, verbose, port_override=port, isolated=isolated))
 
 
 @app.command()
@@ -414,6 +607,15 @@ def status(
         typer.echo(f"      port: {svc.port}")
         typer.echo(f"      upstream: {upstream}")
         typer.echo(f"      health: http://127.0.0.1:{svc.port}{svc.health}")
+        if svc.enabled and upstream != "N/A":
+            entry = registry.read_service_entry(
+                registry.compute_service_identity(svc, upstream)
+            )
+            if entry is not None and registry.entry_is_live(entry):
+                typer.echo(
+                    f"      registry: running (pid {entry.get('pid')}, "
+                    f"owner gateway :{entry.get('owner_port')})"
+                )
         typer.echo()
 
     enabled = [s.name for s in cfg.pipeline if s.enabled]
@@ -503,6 +705,162 @@ def _read_gateway_address(port: int | None = None) -> str | None:
     return None
 
 
+def _lsof_ports_for_config(config_path: str | None) -> list[int]:
+    """Kill listeners on configured service ports via lsof (legacy fallback).
+
+    Mirrors kill-ports.sh's port scan for instances that predate the
+    registry (no lease, nothing reaped).  Returns the pids killed.  Needs
+    *config_path* or a discoverable manifold.yaml.
+    """
+    if not config_path:
+        try:
+            config_path = find_config(None)
+        except ConfigError:
+            return []
+    try:
+        cfg = load_config(config_path)
+    except ConfigError as exc:
+        log.warning("Cannot load config for legacy lsof cleanup: %s", exc)
+        return []
+    pids: list[int] = []
+    for svc in cfg.pipeline:
+        if not svc.enabled:
+            continue
+        try:
+            result = subprocess.run(
+                ["lsof", "-ti", f"TCP:{svc.port}", "-sTCP:LISTEN"],
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.isdigit():
+                pids.append(int(line))
+    # SIGTERM everyone, give them a beat, then SIGKILL survivors (mirrors
+    # kill-ports.sh's TERM-then-KILL escalation).
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            continue
+    if pids:
+        time.sleep(0.5)
+    for pid in pids:
+        if not registry.pid_alive(pid):
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    return pids
+
+
+def _down_one(port: int, config_path: str | None) -> None:
+    """Stop the gateway on *port* and reap its registry-tracked services.
+
+    Ordered so that even a dead or hung gateway is fully torn down:
+    1. snapshot the lease + pid file BEFORE signaling,
+    2. signal the gateway (SIGTERM → poll → SIGKILL),
+    3. reap by registry: transfer entries a live other lease still needs
+       (I7), kill the rest,
+    4. owner_port sweep for entries that never made it into a lease,
+    5. clean up lease/pid/port files,
+    6. legacy lsof fallback only when there was no registry trace at all.
+    """
+    # 1. Snapshot BEFORE signaling (the gateway's own handler may clean up).
+    lease = registry.read_lease(port)
+    snapshot_identities = list(lease.get("identities", [])) if lease else []
+    pid_file = paths.pid_file_for(port)
+    port_file = paths.port_file_for(port)
+    gw_pid: int | None = None
+    if pid_file.exists():
+        try:
+            gw_pid = int(pid_file.read_text().strip())
+        except ValueError:
+            gw_pid = None
+
+    # 2. Gateway signal: SIGTERM, poll up to 5s, SIGKILL if it hangs.
+    if gw_pid is not None and registry.pid_alive(gw_pid):
+        try:
+            os.kill(gw_pid, signal.SIGTERM)
+            typer.echo(f"Sent SIGTERM to manifold on port {port} (pid={gw_pid})")
+        except PermissionError:
+            typer.echo(f"Permission denied sending signal to pid={gw_pid}", err=True)
+            raise typer.Exit(1)
+        deadline = time.monotonic() + 5.0
+        while registry.pid_alive(gw_pid) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        if registry.pid_alive(gw_pid):
+            log.info("Gateway %d still alive after SIGTERM — SIGKILL", port)
+            try:
+                os.kill(gw_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            time.sleep(0.5)
+    elif gw_pid is not None:
+        typer.echo(f"Process {gw_pid} not found — cleaning up stale PID file.")
+
+    # 3. Direct reap by registry: for each snapshotted identity.
+    other_live = registry.live_other_leases(port)
+    surviving: set[str] = set()
+    holder_of: dict[str, dict] = {}
+    for other in other_live:
+        for ident in other.get("identities", []):
+            surviving.add(ident)
+            holder_of.setdefault(ident, other)
+
+    reaped = False
+    for identity in snapshot_identities:
+        entry = registry.read_service_entry(identity)
+        if entry is None:
+            continue
+        if identity in surviving:
+            # Another live gateway still needs it — transfer ownership (I7).
+            holder = holder_of[identity]
+            entry["owner_port"] = holder["gateway_port"]
+            entry["owner_pid"] = holder["gateway_pid"]
+            registry.write_service_entry(entry)
+            log.info(
+                "Transferred '%s' ownership to gateway :%s",
+                identity,
+                holder["gateway_port"],
+            )
+        elif entry.get("owner_port") == port or not registry.pid_alive(
+            entry.get("owner_pid")
+        ):
+            # We are the last live lease holder (I7): kill when WE are the
+            # recorded owner, or when the recorded owner is dead (the
+            # transfer branch above covered the live-owner case).
+            registry.kill_entry_processes(entry)
+            registry.remove_service_entry(identity)
+            reaped = True
+
+    # 4. owner_port sweep: entries owned by this gateway that never made it
+    #    into the lease (crash-mid-startup).
+    for entry in registry.list_service_entries():
+        if entry.get("owner_port") != port:
+            continue
+        if entry["identity"] in surviving:
+            continue
+        registry.kill_entry_processes(entry)
+        registry.remove_service_entry(entry["identity"])
+        reaped = True
+
+    # 5. File cleanup.
+    registry.remove_lease(port)
+    pid_file.unlink(missing_ok=True)
+    port_file.unlink(missing_ok=True)
+
+    # 6. Legacy fallback — only when there was no registry trace at all.
+    if lease is None and not reaped:
+        killed = _lsof_ports_for_config(config_path)
+        if killed:
+            typer.echo(f"Killed {len(killed)} legacy process(es) via lsof port scan")
+
+
 @app.command()
 def down(
     port: int = typer.Option(
@@ -511,21 +869,42 @@ def down(
         "-p",
         help="Gateway port of the instance to stop",
     ),
+    all: bool = typer.Option(
+        False,
+        "--all",
+        help="Stop every running manifold instance",
+    ),
+    config: str = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to manifold.yaml (used by the legacy lsof fallback)",
+    ),
 ) -> None:
     """Stop a running manifold instance."""
-    gw_port, pid_file, port_file = _resolve_instance(port)
-
-    pid = int(pid_file.read_text().strip())
+    if all:
+        discovered: set[int] = set()
+        for lease in registry.list_leases():
+            discovered.add(lease["gateway_port"])
+        for gw_port, _, _ in _discover_instances():
+            discovered.add(gw_port)
+        for gw_port in sorted(discovered):
+            _down_one(gw_port, config)
+        registry.sweep_stale()
+        return
     try:
-        os.kill(pid, signal.SIGTERM)
-        typer.echo(f"Sent SIGTERM to manifold on port {gw_port} (pid={pid})")
-    except ProcessLookupError:
-        typer.echo(f"Process {pid} not found — cleaning up stale PID file.")
-        pid_file.unlink(missing_ok=True)
-        port_file.unlink(missing_ok=True)
-    except PermissionError:
-        typer.echo(f"Permission denied sending signal to pid={pid}", err=True)
-        raise typer.Exit(1)
+        gw_port, _pid_file, _port_file = _resolve_instance(port)
+    except typer.Exit:
+        # A dead gateway may have lost its pid file (kill-ports.sh removes
+        # them) while registry entries remain — the registry is the source
+        # of truth for teardown, not the pid file.
+        has_registry = registry.read_lease(port) is not None or any(
+            entry.get("owner_port") == port for entry in registry.list_service_entries()
+        )
+        if not has_registry:
+            raise
+        gw_port = port
+    _down_one(gw_port, config)
 
 
 @app.command()

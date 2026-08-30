@@ -10,8 +10,17 @@
 #      group.  Since manifold uses killpg on Unix, one group-kill cleans up
 #      the gateway AND every pipeline child process — even when manifold
 #      reassigned ports at runtime.
-#   2. Fall back to port-scanning from the YAML config for any stragglers.
+#   2. Lease-aware teardown via `manifold down`: the CLI reaps services
+#      through the registry (~/.manifold/run/), signals the gateway, and
+#      falls back to a lsof port scan itself for pre-registry instances.
+#      The raw port scan below only runs if the manifold CLI is unavailable
+#      (no uv, or the repo isn't synced).
 set -euo pipefail
+
+# Resolve the repo root from the script location so `uv run manifold` works
+# regardless of the caller's working directory (scripts/../).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 PID_DIR="$HOME/.manifold"
 CONFIG="manifold.yaml"
@@ -70,19 +79,26 @@ if [ -f "$PID_FILE" ]; then
     fi
 fi
 
-# ── Step 2: fall back to YAML port scan for any stragglers ───────────────────
+# ── Step 2: lease-aware teardown via `manifold down` ─────────────────────────
+# `manifold down --port <port> --config <config>` is now the authoritative
+# teardown path: it reaps service processes through the registry, transfers
+# ownership to surviving gateways that still lease them (shared mode), and
+# includes the legacy lsof scan for pre-registry instances.  We only fall
+# back to the raw port scan here when the manifold CLI itself is unavailable.
 
-if [ ! -f "$CONFIG" ]; then
-    if [ "$killed" -gt 0 ]; then
-        echo "Done."
-    else
-        echo "No PID file at $PID_FILE and no config at $CONFIG"
-        echo "Try: ./scripts/kill-ports.sh --config <your-config.yaml> --port <port>"
+scan_stragglers() {
+    # Legacy fallback: blind lsof scan of the config's service ports.
+    if [ ! -f "$CONFIG" ]; then
+        if [ "$killed" -gt 0 ]; then
+            echo "Done."
+        else
+            echo "No PID file at $PID_FILE and no config at $CONFIG"
+            echo "Try: ./scripts/kill-ports.sh --config <your-config.yaml> --port <port>"
+        fi
+        exit 0
     fi
-    exit 0
-fi
 
-ports=$(uv run python -c "
+    ports=$(uv run python -c "
 import yaml
 with open('$CONFIG') as f:
     cfg = yaml.safe_load(f) or {}
@@ -94,22 +110,53 @@ for svc in cfg.get('pipeline') or []:
 print(' '.join(str(p) for p in result))
 " 2>/dev/null || true)
 
-stragglers=0
-for port in $ports; do
-    if [ "$port" = "$GW_PORT" ]; then continue; fi
-    pids=$(lsof -ti TCP:"$port" -s TCP:LISTEN 2>/dev/null || true)
-    for pid in $pids; do
-        cmd=$(ps -p "$pid" -o comm= 2>/dev/null || echo "?")
-        echo "Port $port: still alive (pid $pid, $cmd) → killing"
-        kill "$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null || true
-        stragglers=$((stragglers + 1))
+    stragglers=0
+    for port in $ports; do
+        if [ "$port" = "$GW_PORT" ]; then continue; fi
+        pids=$(lsof -ti TCP:"$port" -s TCP:LISTEN 2>/dev/null || true)
+        for pid in $pids; do
+            cmd=$(ps -p "$pid" -o comm= 2>/dev/null || echo "?")
+            echo "Port $port: still alive (pid $pid, $cmd) → killing"
+            kill "$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null || true
+            stragglers=$((stragglers + 1))
+        done
     done
-done
 
-if [ "$killed" -gt 0 ]; then
-    echo "Done — pipeline killed via process group."
-elif [ "$stragglers" -gt 0 ]; then
-    echo "Done — $stragglers straggler(s) killed."
+    if [ "$killed" -gt 0 ]; then
+        echo "Done — pipeline killed via process group."
+    elif [ "$stragglers" -gt 0 ]; then
+        echo "Done — $stragglers straggler(s) killed."
+    else
+        echo "Nothing to kill."
+    fi
+}
+
+manifold_ok=0
+if command -v uv >/dev/null 2>&1; then
+    if (cd "$REPO_ROOT" && uv run manifold down --help >/dev/null 2>&1); then
+        manifold_ok=1
+    fi
+fi
+
+if [ "$manifold_ok" -eq 1 ]; then
+    down_args=(--port "$GW_PORT")
+    # --config feeds `manifold down`'s internal legacy lsof fallback for
+    # pre-registry instances; only pass it when the file actually exists.
+    # Resolve it to an absolute path: the `manifold down` call runs from
+    # $REPO_ROOT, so a relative path must keep meaning the caller's cwd.
+    if [ -f "$CONFIG" ]; then
+        CONFIG_ABS="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
+        down_args+=(--config "$CONFIG_ABS")
+    fi
+    echo "Running lease-aware teardown: manifold down ${down_args[*]}"
+    if (cd "$REPO_ROOT" && uv run manifold down "${down_args[@]}"); then
+        :  # down handled teardown (registry reaping + its own lsof fallback)
+    else
+        rc=$?
+        echo "manifold down exited $rc — scanning ports for stragglers"
+        scan_stragglers
+    fi
 else
-    echo "Nothing to kill."
+    echo "manifold CLI unavailable — falling back to port scan"
+    scan_stragglers
 fi

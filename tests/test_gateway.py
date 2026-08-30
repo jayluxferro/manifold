@@ -56,6 +56,43 @@ def test_manifold_config_endpoint(client):
     assert data["pipeline"][0]["name"] == "test-svc"
     assert data["pipeline"][0]["status"] == "healthy"
     assert data["gateway"]["port"] == 9000
+    # Registry fields are always present; _make_pipeline's service is owned
+    # by this gateway, so it is not adopted and has no owner_port.
+    assert data["pipeline"][0]["adopted"] is False
+    assert data["pipeline"][0]["owner_port"] is None
+
+
+def test_manifold_config_reports_adopted_service():
+    """Adopted services expose their owner gateway's port in /_manifold/config."""
+    svc = ServiceConfig(
+        name="adopted-svc",
+        directory="/tmp",
+        command="echo",
+        port=7002,
+        health="/h",
+        upstream_via=UpstreamVia.CLI_ARG,
+    )
+    state = ServiceState(
+        config=svc,
+        status=ServiceStatus.HEALTHY,
+        pid=4242,
+        adopted=True,
+        owner_port=9001,
+    )
+    state.upstream_url = "https://api.anthropic.com"
+    pipeline = PipelineState(services=[state])
+    app = create_app(
+        pipeline=pipeline,
+        gateway_config=GatewayConfig(),
+        get_entry_url=lambda: "http://127.0.0.1:7002",
+    )
+
+    with TestClient(app) as c:
+        resp = c.get("/_manifold/config")
+        assert resp.status_code == 200
+        svc_data = resp.json()["pipeline"][0]
+        assert svc_data["adopted"] is True
+        assert svc_data["owner_port"] == 9001
 
 
 def test_manifold_health_returns_ok(client):

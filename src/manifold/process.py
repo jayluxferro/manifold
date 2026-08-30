@@ -62,6 +62,8 @@ async def start_service(
         atexit.register(sync_kill_tracked_subprocesses)
         _atexit_registered = True
 
+    # A fresh spawn is always owned by this gateway — never adopted (I1)
+    state.adopted = False
     svc = state.config
     cmd = resolve_command(svc, upstream_url)
     log.info("Starting %s: %s (cwd=%s)", svc.name, cmd, svc.directory)
@@ -80,6 +82,12 @@ async def start_service(
     proc = await asyncio.create_subprocess_shell(cmd, **sub_kw)
     _processes[svc.name] = proc
     state.pid = proc.pid
+
+    if _use_killpg() and proc.pid is not None:
+        try:
+            state.pgid = os.getpgid(proc.pid)
+        except (ProcessLookupError, OSError):
+            state.pgid = None
 
     # Set up per-service file logger
     svc_logger = setup_service_log(svc.name)
@@ -137,6 +145,12 @@ async def _watch_exit(state: ServiceState, proc: asyncio.subprocess.Process) -> 
 
 async def stop_service(state: ServiceState) -> None:
     """Gracefully stop a service subprocess and its entire process group."""
+    # never kill a process another gateway owns (I1)
+    if state.adopted:
+        state.status = ServiceStatus.STOPPED
+        state.pid = None
+        return
+
     name = state.config.name
     proc = _processes.get(name)
     if proc is None:
@@ -175,9 +189,28 @@ async def stop_service(state: ServiceState) -> None:
         log.debug("OS error stopping %s: %s", name, exc)
 
     state.pid = None
+    state.pgid = None
     _processes.pop(name, None)
     await _cancel_log_tasks(name)
     log.info("%s stopped", name)
+
+
+async def release_service(state: ServiceState) -> None:
+    """Hand off ownership of a running service without killing it.
+
+    Another gateway still owns this process (I1): we only drop our tracking.
+    The log-forwarder tasks keep draining the pipes until the child exits —
+    cancelling them would fill the child's pipe buffer and stall it on its
+    next write.
+    """
+    name = state.config.name
+    _processes.pop(name, None)
+    # Keep pipes draining until the child exits; cancelling would fill the
+    # child's pipe buffer and block it on its next write.
+    _log_tasks.pop(name, None)
+    state.status = ServiceStatus.STOPPED
+    state.pid = None
+    state.pgid = None
 
 
 async def stop_all(services: list[ServiceState]) -> None:
