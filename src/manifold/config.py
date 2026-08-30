@@ -107,6 +107,11 @@ def _parse_gateway(raw: dict | None) -> GatewayConfig:
         raise ConfigError(
             "gateway.startup_health_poll_interval must be <= gateway.startup_health_timeout"
         )
+    scope = raw.get("rate_limit_scope", "session")
+    if scope not in ("session", "port"):
+        raise ConfigError(
+            f"gateway.rate_limit_scope must be 'session' or 'port', got {scope!r}"
+        )
     return GatewayConfig(
         host=raw.get("host", "127.0.0.1"),
         port=int(raw.get("port", 9000)),
@@ -114,6 +119,7 @@ def _parse_gateway(raw: dict | None) -> GatewayConfig:
         startup_health_timeout=timeout,
         startup_health_poll_interval=poll,
         startup_health_strict=bool(raw.get("startup_health_strict", False)),
+        rate_limit_scope=scope,
     )
 
 

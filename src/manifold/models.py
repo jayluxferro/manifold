@@ -51,6 +51,12 @@ class GatewayConfig:
     startup_health_poll_interval: float = 0.25
     # If true, ``manifold up`` exits non-zero when startup health never succeeds.
     startup_health_strict: bool = False
+    # Rate-limit budget scope in hivemind (shared-service chains):
+    # "session" (default) keeps hivemind's per-session buckets;
+    # "port" stamps x-hivemind-agent-id with this gateway's port so every
+    # request from this gateway shares one budget bucket, independent of
+    # other gateways on the same shared services.
+    rate_limit_scope: str = "session"
 
 
 @dataclass

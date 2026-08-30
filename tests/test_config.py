@@ -179,6 +179,46 @@ def test_gateway_startup_health_options(tmp_path: Path):
     assert cfg.gateway.startup_health_strict is True
 
 
+def test_gateway_rate_limit_scope_parsing(tmp_path: Path):
+    content = textwrap.dedent("""\
+        gateway:
+          port: 9000
+          rate_limit_scope: port
+        pipeline:
+          - name: a
+            directory: /tmp
+            command: "echo"
+            port: 7001
+            health: /h
+            upstream_via: cli_arg
+    """)
+    p = tmp_path / "manifold.yaml"
+    p.write_text(content)
+    assert load_config(p).gateway.rate_limit_scope == "port"
+
+    p.write_text(content.replace("rate_limit_scope: port", ""))
+    assert load_config(p).gateway.rate_limit_scope == "session"  # default
+
+
+def test_gateway_rate_limit_scope_invalid_value(tmp_path: Path):
+    content = textwrap.dedent("""\
+        gateway:
+          port: 9000
+          rate_limit_scope: per-chain
+        pipeline:
+          - name: a
+            directory: /tmp
+            command: "echo"
+            port: 7001
+            health: /h
+            upstream_via: cli_arg
+    """)
+    p = tmp_path / "manifold.yaml"
+    p.write_text(content)
+    with pytest.raises(ConfigError):
+        load_config(p)
+
+
 def test_gateway_startup_health_invalid_timeout(tmp_path: Path):
     content = textwrap.dedent("""\
         gateway:

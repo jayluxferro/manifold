@@ -292,3 +292,31 @@ Checklist, in implementation order (each item lands with its tests):
    fallback in `manifold down`.
 5. **`--port` semantics change**: breaking for delta-offset users; mitigated
    by `--isolated` + README documentation.
+
+## 11. Per-port rate-limit budgets (2026-08-30 extension)
+
+Shared services mean one hivemind process serves every gateway. Hivemind's
+rate limiter buckets per session by default (`metadata.user_id` — verified
+live: two `mu-*` buckets, one per Claude Code session), so sessions already
+have independent budgets. `gateway.rate_limit_scope: port` gives each gateway
+port its own bucket instead.
+
+**Mechanism**: the gateway stamps `x-hivemind-agent-id: gateway-<port>` on
+every proxied request. Hivemind's `resolve_rate_key` honors that header as an
+explicit identity (no hivemind changes). Verified live 2026-08-30: the header
+survives all 7 chain layers end-to-end (probe bucket appeared at hivemind
+with the request counter incremented).
+
+**Rules**:
+- The stamp overwrites any client-supplied value — the gateway is the trust
+  boundary; a client-chosen bucket would escape the port budget.
+- `scope: session` (default) stamps nothing and preserves hivemind's
+  per-session bucketing.
+- Locally-routed requests (local-splitter) never reach hivemind and are
+  correctly outside the budget.
+
+**Caveats**: sessions on the same port share that port's bucket (per-port
+and per-session granularity conflict — you pick one); process-wide ceilings
+(admission `max_concurrency`, queue, budget manager) remain shared across
+ports; true per-port concurrency isolation would require partitioning
+hivemind's admission control (cross-repo, not implemented).

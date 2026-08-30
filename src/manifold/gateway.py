@@ -87,6 +87,14 @@ async def _proxy(request: Request) -> Response:
     headers.pop("transfer-encoding", None)
     headers.pop("content-length", None)
 
+    if _gateway_config.rate_limit_scope == "port":
+        # Per-port rate-limit budgets: one bucket per gateway port in
+        # hivemind's per-agent limiter (verified live: the header survives
+        # all 7 chain layers).  Overwrite unconditionally — the gateway is
+        # the trust boundary; a client-supplied value would let a client
+        # pick its own bucket and escape the port budget.
+        headers["x-hivemind-agent-id"] = f"gateway-{_gateway_config.port}"
+
     # Auth normalization.  Anthropic accepts two different auth methods,
     # and they are NOT interchangeable:
     #

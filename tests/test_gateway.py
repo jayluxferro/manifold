@@ -264,3 +264,44 @@ def test_lifespan_closes_http_client():
         assert not gw_mod._http_client.is_closed
     # After lifespan teardown, client is closed
     assert gw_mod._http_client.is_closed
+
+
+def test_per_port_scope_stamps_bucket_header_and_overwrites_client_value():
+    """rate_limit_scope=port: every proxied request carries
+    x-hivemind-agent-id: gateway-<port>, overwriting any client value —
+    the gateway is the trust boundary for per-port budgets."""
+    pipeline = _make_pipeline()
+    app = create_app(
+        pipeline=pipeline,
+        gateway_config=GatewayConfig(port=9001, rate_limit_scope="port"),
+        get_entry_url=lambda: "http://127.0.0.1:7001",
+    )
+
+    with TestClient(app) as c:
+        captured = _install_capture_transport()
+        resp = c.post(
+            "/v1/messages",
+            json={"model": "test"},
+            headers={"x-hivemind-agent-id": "client-chosen-bucket"},
+        )
+
+    assert resp.status_code == 200
+    assert captured["headers"]["x-hivemind-agent-id"] == "gateway-9001"
+
+
+def test_session_scope_does_not_stamp_bucket_header():
+    """Default scope=session: the gateway must not add x-hivemind-agent-id —
+    hivemind keeps its per-session bucketing."""
+    pipeline = _make_pipeline()
+    app = create_app(
+        pipeline=pipeline,
+        gateway_config=GatewayConfig(rate_limit_scope="session"),
+        get_entry_url=lambda: "http://127.0.0.1:7001",
+    )
+
+    with TestClient(app) as c:
+        captured = _install_capture_transport()
+        resp = c.post("/v1/messages", json={"model": "test"})
+
+    assert resp.status_code == 200
+    assert "x-hivemind-agent-id" not in captured["headers"]

@@ -72,6 +72,7 @@ gateway:
   # startup_health_timeout: 120
   # startup_health_poll_interval: 0.25
   # startup_health_strict: false   # true → `manifold up` fails if services never become healthy
+  # rate_limit_scope: session      # session (default) | port — see "Per-port rate limits"
 
 pipeline:
   - name: llm-redactor
@@ -156,6 +157,26 @@ process and only proxies through it. This is tracked in a local registry under
   services directly from the registry even when the gateway process is dead or
   hung, then transfers ownership to any surviving gateways that still lease
   them.
+
+### Per-port rate limits
+
+With shared services, one hivemind process serves every gateway. Hivemind's
+rate limiter buckets per **session** by default (via `metadata.user_id`), so
+sessions already have independent budgets. To give each gateway **port** its
+own budget instead, set `gateway.rate_limit_scope: port`:
+
+```yaml
+gateway:
+  rate_limit_scope: port   # one hivemind budget bucket per gateway port
+```
+
+The gateway then stamps `x-hivemind-agent-id: gateway-<port>` on every
+proxied request (overwriting any client-supplied value — the gateway is the
+trust boundary). Per-port limits can be set via hivemind's `--agent-limit
+gateway-9001:rpm=N,tpm=M` or its `hm.budget` tool; the default bucket limits
+apply otherwise. Caveats: sessions on the same port share that port's budget;
+process-wide ceilings (admission `max_concurrency`, queue) remain shared; and
+requests answered locally by local-splitter never reach hivemind's budgets.
 
 ## CLI
 
