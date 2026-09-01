@@ -305,6 +305,13 @@ def create_app(
         global _http_client
         _http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(300.0, connect=10.0),
+            # keepalive_expiry=2.0: retire pooled connections before the
+            # entry service's uvicorn closes them at its 5s idle timeout —
+            # the next POST after a >5s gap would otherwise be written into
+            # a connection the server already closed, surfacing as an
+            # intermittent "Upstream unreachable" 502 (2026-09-01, same
+            # race fixed chain-wide in every layer's upstream client).
+            limits=httpx.Limits(keepalive_expiry=2.0),
             # Empty default user-agent so httpx doesn't inject python-httpx/X.Y.Z;
             # the agent's original user-agent flows through via forwarded headers.
             headers={"user-agent": ""},
