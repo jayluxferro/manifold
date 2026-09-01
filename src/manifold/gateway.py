@@ -304,7 +304,12 @@ def create_app(
     async def lifespan(app):
         global _http_client
         _http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(300.0, connect=10.0),
+            # read=330.0 sits ABOVE the chain's 300s ceiling so a deep stall
+            # produces a typed 504/429 verdict from the chain (hivemind fails
+            # first at 240s) instead of the gateway aborting its own 300s
+            # read — the old alignment surfaced as a bare ReadTimeout with
+            # zero downstream logs (2026-09-01).
+            timeout=httpx.Timeout(330.0, connect=10.0),
             # keepalive_expiry=2.0: retire pooled connections before the
             # entry service's uvicorn closes them at its 5s idle timeout —
             # the next POST after a >5s gap would otherwise be written into
