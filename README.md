@@ -205,6 +205,18 @@ of spawning duplicates. Use **`--isolated`** if you need the old behavior
 second chain) — isolated instances are still registry-tracked, so `down`
 cleans them reliably.
 
+**Multiple configs on one machine** — sharing is wiring-exact, so two configs
+that declare the same service ports with *different* wiring (e.g. a kimi-fallback
+variant of the main chain) cannot share processes, and `up` fails preflight with
+`Port <n> for service '<name>' is already in use by a different wiring (identity
+<…>, owner gateway :<port>)`. Two remedies:
+
+- Give each config its **own explicit service ports** in the YAML (the clean
+  long-term setup — each config owns its ports, both run side-by-side).
+- Or keep shared ports and use **`--isolated --port <far-away-port>`** to
+  delta-offset the second chain to collision-free ports (the pre-registry
+  behavior; e.g. `--port 23456` offsets services by +14456).
+
 **`manifold down`** — accepts `--port <port>` (teardown a specific gateway
 port; needed when multiple instances run), `--all` (teardown every discovered
 instance), and `--config <path>` (feeds the legacy lsof fallback for
