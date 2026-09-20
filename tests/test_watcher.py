@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from manifold import registry
+from manifold import registry, watcher as watcher_module
 from manifold.config import load_config
 from manifold.models import (
     ManifoldConfig,
@@ -132,6 +132,59 @@ async def test_watcher_ignores_invalid_config(config_file: Path):
 
         # Should not have applied changes
         assert mock_apply.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_watcher_survives_apply_crash_and_applies_later_change(
+    tmp_path: Path, config_file: Path, monkeypatch
+):
+    """M4: one crashing tick must not kill the watcher — the next valid
+    change still applies.  A KeyError here used to cancel the task forever,
+    silently disabling hot-reload and MCP enable/disable."""
+    # Shrink the backoff so the retry isn't slowed by the test.
+    monkeypatch.setattr(watcher_module, "RELOAD_BACKOFF_BASE", 0.01)
+    monkeypatch.setattr(watcher_module, "RELOAD_BACKOFF_MAX", 0.02)
+
+    cfg = load_config(config_file)
+    pipeline = PipelineState(services=[ServiceState(config=cfg.pipeline[0])])
+    gateway = cfg.gateway
+    stop_event = asyncio.Event()
+
+    real_apply = watcher_module._apply_config_changes
+    calls: list[ManifoldConfig] = []
+
+    async def _flaky_apply(new_cfg, *args, **kwargs):
+        calls.append(new_cfg)
+        if len(calls) == 1:
+            raise KeyError("simulated reload crash")
+        return await real_apply(new_cfg, *args, **kwargs)
+
+    with patch("manifold.watcher._apply_config_changes", side_effect=_flaky_apply):
+        task = asyncio.create_task(
+            watch_config(
+                config_file, pipeline, gateway, interval=0.05, stop_event=stop_event
+            )
+        )
+
+        # First change: apply crashes (KeyError above).
+        await asyncio.sleep(0.12)
+        config_file.write_text(
+            config_file.read_text().replace("enabled: true", "enabled: false")
+        )
+        await asyncio.sleep(0.35)
+        assert len(calls) == 1  # crashed — and the watcher is STILL alive
+
+        # Second change: applied through the real code path.
+        config_file.write_text(
+            config_file.read_text().replace("enabled: false", "enabled: true")
+        )
+        await asyncio.sleep(0.35)
+        stop_event.set()
+        await task  # would hang/raise if the loop had died
+
+    assert len(calls) == 2
+    assert calls[1].pipeline[0].enabled is True
+    assert pipeline.services[0].config.enabled is True
 
 
 # --- shared-mode (registry-aware) reloads -----------------------------------

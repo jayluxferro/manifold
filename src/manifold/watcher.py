@@ -28,6 +28,15 @@ log = logging.getLogger(__name__)
 
 DEFAULT_POLL_INTERVAL = 2.0
 
+# Backoff for repeated reload failures (M4).  _apply_config_changes used to
+# run unguarded inside the loop: one KeyError/OSError killed the watcher task
+# forever — the gateway kept running but config edits and MCP enable/disable
+# silently stopped applying, with nothing in the logs after the traceback.
+# The delay doubles per consecutive failure (capped) and resets on the first
+# successful apply.
+RELOAD_BACKOFF_BASE = 2.0
+RELOAD_BACKOFF_MAX = 30.0
+
 
 async def watch_config(
     config_path: str | Path,
@@ -53,6 +62,7 @@ async def watch_config(
     """
     config_path = Path(config_path)
     last_mtime: float = config_path.stat().st_mtime if config_path.exists() else 0
+    consecutive_failures = 0
 
     while True:
         if stop_event and stop_event.is_set():
@@ -70,7 +80,12 @@ async def watch_config(
         if not config_path.exists():
             continue
 
-        current_mtime = config_path.stat().st_mtime
+        try:
+            current_mtime = config_path.stat().st_mtime
+        except OSError:
+            # Vanished between exists() and stat() — treat as "no change"
+            # this tick instead of killing the watcher.
+            continue
         if current_mtime <= last_mtime:
             continue
 
@@ -83,9 +98,27 @@ async def watch_config(
             log.error("Invalid config after change, ignoring: %s", exc)
             continue
 
-        await _apply_config_changes(
-            new_cfg, pipeline, gateway, gw_port, gw_pid, isolated
-        )
+        # Broad guard around the tick's apply (M4): a crash here must cost
+        # one reload, not the watcher.  Repeated failures back off so a
+        # persistently broken reload doesn't spin.
+        try:
+            await _apply_config_changes(
+                new_cfg, pipeline, gateway, gw_port, gw_pid, isolated
+            )
+            consecutive_failures = 0
+        except Exception:
+            consecutive_failures += 1
+            backoff = min(
+                RELOAD_BACKOFF_BASE * 2 ** (consecutive_failures - 1),
+                RELOAD_BACKOFF_MAX,
+            )
+            log.exception(
+                "Config reload failed (attempt %d) — watcher stays alive, "
+                "retrying after %.1fs",
+                consecutive_failures,
+                backoff,
+            )
+            await asyncio.sleep(backoff)
 
 
 async def _apply_config_changes(
