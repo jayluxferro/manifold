@@ -212,6 +212,32 @@ def test_preflight_shared_non_manifold_process_is_error(tmp_path: Path):
     assert excinfo.value.exit_code == 1
 
 
+def test_preflight_shared_foreign_shim_names_owner_gateway(tmp_path: Path, caplog):
+    """A port held by another gateway's crash shim stays a hard error (we
+    cannot stop another process's listener), but the message must name the
+    shimming gateway — the old 'non-manifold process' framing sent owners
+    chasing ghosts."""
+    import logging
+
+    svc = _svc()
+    cfg = _cfg(services=[svc])
+    with patch("manifold.paths.PID_DIR", tmp_path):
+        with (
+            patch(
+                "manifold.paths.is_port_in_use",
+                side_effect=lambda port, host="127.0.0.1": port == 7001,
+            ),
+            patch.object(service_ops, "find_live_shim_owner", return_value=9100),
+        ):
+            with caplog.at_level(logging.ERROR, logger="manifold"):
+                with pytest.raises(typer.Exit) as excinfo:
+                    _preflight_check(cfg, shared=True)
+    assert excinfo.value.exit_code == 1
+    assert any(
+        "crash shim from gateway :9100" in r.getMessage() for r in caplog.records
+    )
+
+
 def test_preflight_gateway_port_in_use_is_error(tmp_path: Path):
     cfg = _cfg()
     with patch("manifold.paths.PID_DIR", tmp_path):
@@ -266,6 +292,84 @@ def test_plan_service_error_when_port_taken(tmp_path: Path):
             decision, payload = service_ops._plan_service(svc, FALLBACK)
     assert decision == "error"
     assert "7001" in str(payload)
+
+
+def test_plan_service_own_shim_port_is_reclaimable(tmp_path: Path):
+    """A port held by THIS gateway's crash shim is not a conflict: the spawn
+    path's choke point (process.start_service) stops the shim before the
+    child binds, so planning proceeds to a spawn."""
+    svc = _svc()
+    with patch("manifold.paths.PID_DIR", tmp_path):
+        with (
+            patch("manifold.paths.is_port_in_use", return_value=True),
+            patch("manifold.shim.get_shim", return_value=object()),
+        ):
+            decision, payload = service_ops._plan_service(svc, FALLBACK)
+    assert decision == "spawn"
+    assert payload is None
+
+
+def test_plan_service_error_names_live_shim_owner(tmp_path: Path):
+    """A foreign gateway's shim cannot be reclaimed, but the error must not
+    call it a 'non-manifold process' — it names the shimming gateway."""
+    svc = _svc()
+    with patch("manifold.paths.PID_DIR", tmp_path):
+        with (
+            patch("manifold.paths.is_port_in_use", return_value=True),
+            patch.object(service_ops, "find_live_shim_owner", return_value=9100),
+        ):
+            decision, payload = service_ops._plan_service(svc, FALLBACK)
+    assert decision == "error"
+    assert "crash shim from gateway :9100" in str(payload)
+
+
+def test_find_live_shim_owner_reports_shimming_gateway(tmp_path: Path):
+    """Walks the live leases' /_manifold/config endpoints and returns the
+    gateway whose pipeline reports shim=true on the port."""
+
+    seen: dict[str, str] = {}
+
+    class _FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"pipeline": [{"name": "svc-a", "port": 7001, "shim": True}]}
+
+    class _FakeClient:
+        def __init__(self, **_kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def get(self, url):
+            seen["url"] = url
+            return _FakeResponse()
+
+    with patch("manifold.paths.PID_DIR", tmp_path):
+        registry.write_lease(9100, os.getpid(), [], isolated=False)
+        with patch.object(service_ops.httpx, "Client", _FakeClient):
+            assert service_ops.find_live_shim_owner(7001) == 9100
+            assert seen["url"] == "http://127.0.0.1:9100/_manifold/config"
+            # a port the gateway is not shimming finds no owner
+            assert service_ops.find_live_shim_owner(7002) is None
+
+
+def test_find_live_shim_owner_ignores_dead_leases(tmp_path: Path):
+    """A lease whose gateway pid is dead is not asked (its shims die with it
+    anyway — they are asyncio listeners in that process)."""
+
+    class _Boom:
+        def __init__(self, **_kw):
+            raise AssertionError("no HTTP client may be built for a dead lease")
+
+    with patch("manifold.paths.PID_DIR", tmp_path):
+        registry.write_lease(9100, 999999999, [], isolated=False)
+        with patch.object(service_ops.httpx, "Client", _Boom):
+            assert service_ops.find_live_shim_owner(7001) is None
 
 
 def test_plan_service_removes_stale_entry(tmp_path: Path):
@@ -528,6 +632,30 @@ async def test_spawn_owned_port_busy_raises_without_reclaim(tmp_path: Path):
                     await service_ops._spawn_owned(state, FALLBACK, identity, 9000, 111)
         start_mock.assert_not_awaited()
         assert registry.read_service_entry(identity) is None
+
+
+@pytest.mark.asyncio
+async def test_spawn_owned_reclaims_own_shim_port(tmp_path: Path):
+    """Promote-after-shim: the corpse's port is held by OUR crash shim (the
+    adopter shimmed it before promoting).  That occupant is reclaimable — the
+    spawn stops the shim — not a 'still occupied' failure."""
+    identity = "id-a"
+    entry = _entry(identity, owner_port=9001, owner_pid=999999999)
+    state = ServiceState(config=_svc())
+    with patch("manifold.paths.PID_DIR", tmp_path):
+        registry.write_service_entry(entry)
+        with (
+            patch("manifold.paths.is_port_in_use", return_value=True),
+            patch("manifold.shim.get_shim", return_value=object()),
+        ):
+            start_mock = AsyncMock()
+            with patch("manifold.process.start_service", start_mock):
+                result = await service_ops._spawn_owned(
+                    state, FALLBACK, identity, 9000, 111, reclaim_entry=entry
+                )
+        assert result is True
+        start_mock.assert_awaited_once()
+        assert registry.read_service_entry(identity)["owner_port"] == 9000
 
 
 # --- _shutdown_pipeline -----------------------------------------------------

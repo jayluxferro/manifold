@@ -141,16 +141,47 @@ def _live_shims(cfg) -> dict[str, str]:
         return {}
 
 
-async def _shim_reconcile(pipeline: PipelineState) -> None:
-    """Release a shim whose dead adopted service is being respawned by its owner.
+# Reconcile's TTL backstop: no shim may outlive this, whatever the registry
+# says.  Shims are silent function loss (a shimmed redactor scrubs nothing),
+# so a shim that outlived every release signal must not hold the port
+# forever.  Dead services restart or get swept well inside this window; if
+# none of that happened, traffic degrades LOUDLY (connection refused) instead
+# of silently bypassing the dead layer indefinitely.
+_SHIM_MAX_TTL_SECONDS = 30 * 60.0
 
-    While our shim holds the port, the owner gateway's respawned process
-    cannot bind — it dies on EADDRINUSE and the owner's restart loop refreshes
-    its registry entry with each attempt.  A changed entry pid is the
-    signature of those attempts: drop the shim so the owner's NEXT attempt
-    gets the port back.  Owned services don't need this (their restart stops
-    the shim itself before spawning).
+
+async def _shim_reconcile(pipeline: PipelineState) -> None:
+    """Release crash shims whose release signal has fired.
+
+    Shims on ADOPTED services are owned by registry signals (owned services
+    manage their own shims via the spawn path's choke point):
+
+    - TTL backstop: any shim — adopted or not — older than
+      ``_SHIM_MAX_TTL_SECONDS`` is released loudly.  This is the last line of
+      defense against a permanent port hijack: a released shim can only ever
+      cost availability, while a stuck shim silently loses the layer's
+      function AND blocks the owner's respawn.
+    - entry gone: sweeps remove the entry once the service pid is dead, and
+      removals mean nobody claims the service anymore.  Holding the shim past
+      this point hijacks the port — the owner's next ``up`` would abort on
+      "port in use by a non-manifold process".  The entry vanishing IS a
+      release signal.
+    - entry pid changed: the owner gateway's respawn attempts refresh the
+      entry with each try; a new pid means the next attempt needs the port.
     """
+    for port, handle in shim.all_shims().items():
+        if handle.age_seconds >= _SHIM_MAX_TTL_SECONDS:
+            log.warning(
+                "Shim on port %d (→ %s) exceeded its %ds TTL — releasing it "
+                "regardless of state. If the real service does not rebind, "
+                "traffic to this port now fails visibly instead of bypassing "
+                "the dead layer silently.",
+                port,
+                f"{handle.target_host}:{handle.target_port}",
+                int(_SHIM_MAX_TTL_SECONDS),
+            )
+            await shim.stop_shim(handle)
+
     for state in pipeline.services:
         if not state.adopted or state.identity is None:
             continue
@@ -165,6 +196,14 @@ async def _shim_reconcile(pipeline: PipelineState) -> None:
             )
             continue
         if entry is None:
+            log.info(
+                "Registry entry for adopted service '%s' is gone (swept or "
+                "removed) — releasing shim on port %d so the owner's next "
+                "respawn can rebind",
+                state.config.name,
+                state.config.port,
+            )
+            await shim.stop_shim(handle)
             continue
         entry_pid = entry.get("pid")
         if entry_pid is not None and entry_pid != handle.pid_at_start:
@@ -308,17 +347,39 @@ def _preflight_check(cfg, shared: bool = False) -> list[str]:
                 continue  # identical wiring already running — adoption OK (I6)
             conflict = registry.find_live_entry_by_port(svc.port)
             if conflict is not None:
-                owner = f"owner gateway :{conflict.get('owner_port')}"
+                log.error(
+                    "Port %d for service '%s' is already in use by a different "
+                    "wiring (identity %s…, owner gateway :%s)",
+                    svc.port,
+                    svc.name,
+                    identity[:12],
+                    conflict.get("owner_port"),
+                )
             else:
-                owner = "non-manifold process"
-            log.error(
-                "Port %d for service '%s' is already in use by a different wiring "
-                "(identity %s…, %s)",
-                svc.port,
-                svc.name,
-                identity[:12],
-                owner,
-            )
+                # A foreign gateway's shim cannot be distinguished from a
+                # normal process bind here — but the live gateways will tell
+                # us if one of them holds a shim on this port, and that case
+                # resolves itself (reconcile releases it) instead of being a
+                # permanent conflict.  Say so instead of the misleading
+                # "non-manifold process".
+                shim_gw = service_ops.find_live_shim_owner(svc.port)
+                if shim_gw is not None:
+                    log.error(
+                        "Port %d for service '%s' is held by a crash shim from "
+                        "gateway :%d — it releases when that gateway reconciles "
+                        "(or at its shim TTL); retry shortly, or stop that gateway",
+                        svc.port,
+                        svc.name,
+                        shim_gw,
+                    )
+                else:
+                    log.error(
+                        "Port %d for service '%s' is already in use by a "
+                        "non-manifold process (possibly a crash shim from an "
+                        "unreachable gateway)",
+                        svc.port,
+                        svc.name,
+                    )
             raise typer.Exit(1)
     else:
         service_ports = {s.name: s.port for s in cfg.pipeline if s.enabled}

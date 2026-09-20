@@ -321,6 +321,82 @@ async def test_shim_reconcile_releases_shim_when_owner_respawns(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_shim_reconcile_releases_shim_when_entry_gone(tmp_path):
+    """The entry vanishing IS a release signal: any gateway's sweep removes a
+    dead service's entry, and a held-past-that shim hijacks the port forever —
+    the owner's next `up` would abort on a 'non-manifold process' that is
+    actually our own shim."""
+    with patch("manifold.paths.PID_DIR", tmp_path):
+        port_b = await _free_port()
+        state = _svc("b", port_b)
+        upstream = "http://127.0.0.1:9999"
+        state.identity = registry.compute_service_identity(state.config, upstream)
+        state.adopted = True
+        state.owner_port = 9100
+        registry.write_service_entry(
+            {
+                "schema_version": registry.SCHEMA_VERSION,
+                "identity": state.identity,
+                "name": "b",
+                "pid": 999999999,  # dead corpse pid
+                "owner_port": 9100,
+                "owner_pid": 999999998,  # dead owner: nothing will respawn
+            }
+        )
+        target = await _tcp_server(await _free_port(), _echo_handler)
+        await shim.start_shim(port_b, "127.0.0.1", 1, pid_at_start=999999999)
+        try:
+            # Any gateway's `up` sweeps the dead entry out from under the shim.
+            registry.sweep_stale()
+            assert registry.read_service_entry(state.identity) is None
+
+            await _shim_reconcile(PipelineState(services=[state]))
+            assert shim.get_shim(port_b) is None
+            # The port is free again: a rebinding service (or a fresh `up`)
+            # can take it.
+            reborn = await _tcp_server(port_b, _echo_handler)
+            reborn.close()
+        finally:
+            await shim.stop_shim_for_port(port_b)
+            target.close()
+
+
+@pytest.mark.asyncio
+async def test_shim_reconcile_ttl_backstop_releases_old_shim(tmp_path):
+    """No shim outruns the TTL backstop, whatever the registry says — a shim
+    that outlived every release signal must not hold the port forever."""
+    with patch("manifold.paths.PID_DIR", tmp_path):
+        port_old, port_new = await _free_port(), await _free_port()
+        state = _svc("b", port_old)
+        upstream = "http://127.0.0.1:9999"
+        state.identity = registry.compute_service_identity(state.config, upstream)
+        state.adopted = True
+        live_pid = os.getpid()  # alive: no registry signal ever fires below
+        registry.write_service_entry(
+            {
+                "schema_version": registry.SCHEMA_VERSION,
+                "identity": state.identity,
+                "name": "b",
+                "pid": live_pid,
+                "owner_port": 9100,
+                "owner_pid": os.getpid(),
+            }
+        )
+        target = await _tcp_server(await _free_port(), _echo_handler)
+        old = await shim.start_shim(port_old, "127.0.0.1", 1, pid_at_start=live_pid)
+        new = await shim.start_shim(port_new, "127.0.0.1", 1, pid_at_start=live_pid)
+        try:
+            old.started_at -= 31 * 60  # backdate past the 30-minute TTL
+            await _shim_reconcile(PipelineState(services=[state]))
+            assert shim.get_shim(port_old) is None  # TTL release
+            assert shim.get_shim(port_new) is new  # fresh shim untouched
+        finally:
+            await shim.stop_shim_for_port(port_old)
+            await shim.stop_shim_for_port(port_new)
+            target.close()
+
+
+@pytest.mark.asyncio
 async def test_shim_reconcile_keeps_shim_while_owner_has_not_respawned(tmp_path):
     with patch("manifold.paths.PID_DIR", tmp_path):
         port_b = await _free_port()

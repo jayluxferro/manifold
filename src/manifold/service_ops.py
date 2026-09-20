@@ -18,9 +18,10 @@ import asyncio
 import logging
 import time
 
+import httpx
 import typer
 
-from manifold import paths, process, registry
+from manifold import paths, process, registry, shim
 from manifold.chain import patch_service_config, resolve_command
 from manifold.models import ServiceState, ServiceStatus, UpstreamVia
 
@@ -28,6 +29,33 @@ log = logging.getLogger(__name__)
 
 SPAWN_LOCK_RETRIES = 50
 SPAWN_LOCK_WAIT = 0.2
+
+
+def find_live_shim_owner(port: int) -> int | None:
+    """The live gateway whose ``/_manifold/config`` reports a crash shim on *port*.
+
+    Shims are gateway-local state (the module table in :mod:`manifold.shim`),
+    so another process can only see one through the owner gateway's config
+    endpoint.  Asks every gateway with a live lease; returns None when none
+    reports a shim there (gateway unreachable, or the port holder is not a
+    shim at all).  Only consulted on error paths — never in the hot loop.
+    """
+    for lease in registry.list_leases():
+        gw_port = lease.get("gateway_port")
+        if not registry.pid_alive(lease.get("gateway_pid")):
+            continue
+        try:
+            with httpx.Client(timeout=2.0) as client:
+                resp = client.get(f"http://127.0.0.1:{gw_port}/_manifold/config")
+            if resp.status_code >= 400:
+                continue
+            pipeline = resp.json().get("pipeline", [])
+        except (httpx.HTTPError, ValueError):
+            continue
+        for svc in pipeline:
+            if svc.get("shim") and svc.get("port") == port:
+                return gw_port
+    return None
 
 
 def _plan_service(svc, upstream_url: str) -> tuple[str, dict | str | None]:
@@ -38,6 +66,10 @@ def _plan_service(svc, upstream_url: str) -> tuple[str, dict | str | None]:
     ``("spawn", None)`` when nothing runs here, or ``("error", msg)`` when
     the port is occupied by something else.  Stale entries are removed as a
     side effect (I2).
+
+    A port held by THIS gateway's crash shim is not an error: every spawn
+    stops the shim on its target port before the child binds
+    (``process.start_service``), so the port is reclaimable.
     """
     identity = registry.compute_service_identity(svc, upstream_url)
     entry = registry.read_service_entry(identity)
@@ -52,6 +84,14 @@ def _plan_service(svc, upstream_url: str) -> tuple[str, dict | str | None]:
         log.info("Removing stale entry for '%s'", svc.name)
         registry.remove_service_entry(identity)
     if paths.is_port_in_use(svc.port):
+        if shim.get_shim(svc.port) is not None:
+            log.info(
+                "Port %d for service '%s' is held by this gateway's crash "
+                "shim — treating as reclaimable (the spawn stops the shim)",
+                svc.port,
+                svc.name,
+            )
+            return ("spawn", None)
         conflict = registry.find_live_entry_by_port(svc.port)
         if conflict is not None:
             msg = (
@@ -60,10 +100,20 @@ def _plan_service(svc, upstream_url: str) -> tuple[str, dict | str | None]:
                 f"owner gateway :{conflict.get('owner_port')})"
             )
         else:
-            msg = (
-                f"Port {svc.port} for service '{svc.name}' is already in use "
-                f"by a non-manifold process"
-            )
+            shim_gw = find_live_shim_owner(svc.port)
+            if shim_gw is not None:
+                msg = (
+                    f"Port {svc.port} for service '{svc.name}' is held by a "
+                    f"crash shim from gateway :{shim_gw} — it releases when "
+                    f"that gateway reconciles (or at its shim TTL); retry "
+                    f"shortly or stop that gateway"
+                )
+            else:
+                msg = (
+                    f"Port {svc.port} for service '{svc.name}' is already in "
+                    f"use by a non-manifold process (possibly a crash shim "
+                    f"from an unreachable gateway)"
+                )
         return ("error", msg)
     return ("spawn", None)
 
@@ -126,7 +176,13 @@ async def _spawn_owned(
                     )
                     registry.kill_entry_processes(reclaim_entry)
                     registry.remove_service_entry(reclaim_entry["identity"])
-                    if paths.is_port_in_use(svc.port):
+                    # Our own crash shim (started while the corpse was still
+                    # adopted) holds the port legitimately: the spawn below
+                    # stops it before the child binds.  A genuinely foreign
+                    # occupant still fails the check.
+                    if paths.is_port_in_use(svc.port) and (
+                        shim.get_shim(svc.port) is None
+                    ):
                         # I4: the kill was skipped (pid/pgid reuse) or the
                         # process survived SIGKILL — never spawn on a port we
                         # could not free.
@@ -134,7 +190,11 @@ async def _spawn_owned(
                             f"Port {svc.port} still occupied after reclaiming "
                             f"'{svc.name}' — not spawning"
                         )
-                elif paths.is_port_in_use(svc.port):
+                elif paths.is_port_in_use(svc.port) and (
+                    shim.get_shim(svc.port) is None
+                ):
+                    # An own-shim-held port is reclaimable (choke point in
+                    # start_service stops it); anything else is a race loss.
                     raise typer.Exit(
                         f"Port {svc.port} taken while spawning '{svc.name}'"
                     )

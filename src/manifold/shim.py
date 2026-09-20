@@ -27,6 +27,7 @@ import asyncio
 import contextlib
 import dataclasses
 import logging
+import time
 
 log = logging.getLogger(__name__)
 
@@ -53,8 +54,15 @@ class ShimHandle:
     target_port: int
     server: asyncio.Server | None = None
     pid_at_start: int | None = None
+    # Monotonic birth time — the reconcile loop's TTL backstop releases any
+    # shim that outlives every registry-based release signal.
+    started_at: float = dataclasses.field(default_factory=time.monotonic)
     # One relay task per accepted connection (the task that runs _relay).
     _relays: set[asyncio.Task] = dataclasses.field(default_factory=set, repr=False)
+
+    @property
+    def age_seconds(self) -> float:
+        return time.monotonic() - self.started_at
 
     @property
     def active_connections(self) -> int:
