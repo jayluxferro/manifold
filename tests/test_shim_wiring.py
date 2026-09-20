@@ -398,28 +398,66 @@ async def test_shim_reconcile_ttl_backstop_releases_old_shim(tmp_path):
 
 @pytest.mark.asyncio
 async def test_shim_reconcile_keeps_shim_while_owner_has_not_respawned(tmp_path):
+    """No release signal fired: the entry still names the very pid the shim
+    recorded and that process is alive (e.g. an unhealthy-but-running service
+    or a recycled pid).  The shim keeps protecting the hop."""
     with patch("manifold.paths.PID_DIR", tmp_path):
         port_b = await _free_port()
         state = _svc("b", port_b)
         upstream = "http://127.0.0.1:9999"
         state.identity = registry.compute_service_identity(state.config, upstream)
         state.adopted = True
+        live_pid = os.getpid()
         registry.write_service_entry(
             {
                 "schema_version": registry.SCHEMA_VERSION,
                 "identity": state.identity,
                 "name": "b",
-                "pid": 1111,  # same corpse pid the shim recorded
+                "pid": live_pid,  # same pid the shim recorded, and alive
                 "owner_port": 9100,
             }
         )
         target = await _tcp_server(await _free_port(), _echo_handler)
-        handle = await shim.start_shim(port_b, "127.0.0.1", 1, pid_at_start=1111)
+        handle = await shim.start_shim(port_b, "127.0.0.1", 1, pid_at_start=live_pid)
         try:
             await _shim_reconcile(PipelineState(services=[state]))
             assert shim.get_shim(port_b) is handle
         finally:
             await shim.stop_shim(handle)
+            target.close()
+
+
+@pytest.mark.asyncio
+async def test_shim_reconcile_releases_shim_on_pid_reuse(tmp_path):
+    """A recycled pid makes 'entry pid == recorded pid' meaningless: the
+    owner respawned into the same pid number, so the pid-changed signal never
+    fires.  The recorded pid not being alive is itself the release signal —
+    without it the shim holds the port through every respawn attempt."""
+    with patch("manifold.paths.PID_DIR", tmp_path):
+        port_b = await _free_port()
+        state = _svc("b", port_b)
+        upstream = "http://127.0.0.1:9999"
+        state.identity = registry.compute_service_identity(state.config, upstream)
+        state.adopted = True
+        state.owner_port = 9100
+        recycled = 999999999  # dead: the respawned child died on the held port
+        registry.write_service_entry(
+            {
+                "schema_version": registry.SCHEMA_VERSION,
+                "identity": state.identity,
+                "name": "b",
+                "pid": recycled,  # same number the shim recorded — coincidence
+                "owner_port": 9100,
+                "owner_pid": 9101,
+            }
+        )
+        target = await _tcp_server(await _free_port(), _echo_handler)
+        await shim.start_shim(port_b, "127.0.0.1", 1, pid_at_start=recycled)
+        try:
+            await _shim_reconcile(PipelineState(services=[state]))
+            assert shim.get_shim(port_b) is None
+        finally:
+            await shim.stop_shim_for_port(port_b)
             target.close()
 
 

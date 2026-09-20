@@ -168,6 +168,9 @@ async def _shim_reconcile(pipeline: PipelineState) -> None:
       release signal.
     - entry pid changed: the owner gateway's respawn attempts refresh the
       entry with each try; a new pid means the next attempt needs the port.
+    - recorded pid dead again: an entry pid equal to the shim's recorded pid
+      is weak evidence (pids get recycled), so it is checked for liveness —
+      a dead pid means the entry names a process that does not exist.
     """
     for port, handle in shim.all_shims().items():
         if handle.age_seconds >= _SHIM_MAX_TTL_SECONDS:
@@ -212,6 +215,23 @@ async def _shim_reconcile(pipeline: PipelineState) -> None:
                 "port %d so the real service can rebind",
                 state.config.name,
                 entry_pid,
+                state.config.port,
+            )
+            await shim.stop_shim(handle)
+        elif not registry.pid_alive(handle.pid_at_start):
+            # Pid-reuse guard: an entry pid equal to the shim's recorded pid
+            # proves nothing — the owner's respawned child may have been
+            # recycled into the same pid number as the corpse.  A recorded
+            # pid that is not alive means the process the entry names does
+            # not exist, so no live service is being protected by holding
+            # the port; release it for the owner's next attempt (the TTL
+            # backstop below remains the final safety net).
+            log.info(
+                "Entry pid for adopted service '%s' matches the shim's "
+                "recorded pid %s but that process is not alive (pid reuse?) "
+                "— releasing shim on port %d",
+                state.config.name,
+                handle.pid_at_start,
                 state.config.port,
             )
             await shim.stop_shim(handle)
