@@ -5,7 +5,9 @@ plan/adopt/promote/spawn decision loop, full ``manifold up`` runs against a
 faked uvicorn, registry teardown, and the rewritten ``down``.
 """
 
+import asyncio
 import os
+import signal
 from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -14,7 +16,9 @@ import pytest
 import typer
 from typer.testing import CliRunner
 
+from manifold import cli as cli_module
 from manifold import registry, service_ops
+from manifold.chain import get_entry_url
 from manifold.cli import (
     _apply_port_override,
     _down_one,
@@ -30,6 +34,7 @@ from manifold.models import (
     PipelineState,
     ServiceConfig,
     ServiceState,
+    ServiceStatus,
     UpstreamVia,
 )
 
@@ -889,3 +894,323 @@ async def test_spawn_owned_promote_aborts_when_reclaim_fails(tmp_path: Path):
                 await service_ops._spawn_owned(
                     state, FALLBACK, identity, 9000, os.getpid(), reclaim_entry=entry
                 )
+
+
+# --- mid-spawn failure teardown (M3) -----------------------------------------
+
+
+def _config_file_two_services(tmp_path: Path) -> Path:
+    p = tmp_path / "manifold.yaml"
+    p.write_text(
+        """\
+gateway:
+  host: 127.0.0.1
+  port: 9000
+pipeline:
+  - name: svc-a
+    directory: /tmp
+    command: "echo a --port {port} --upstream {upstream}"
+    port: 7001
+    health: /h
+    upstream_via: cli_arg
+    enabled: true
+  - name: svc-b
+    directory: /tmp
+    command: "echo b --port {port} --upstream {upstream}"
+    port: 7002
+    health: /h
+    upstream_via: cli_arg
+    enabled: true
+"""
+    )
+    return p
+
+
+def test_up_mid_spawn_failure_tears_down_half_chain(tmp_path: Path):
+    """M3: the spawn loop used to sit OUTSIDE the runtime try/finally — a
+    typer.Exit on the SECOND service's spawn left the first running with a
+    lease written and nobody cleaning up.  Now the same _shutdown_pipeline
+    path must run: stop called, entries + lease removed."""
+    config_file = _config_file_two_services(tmp_path)
+    stop_mock = AsyncMock()
+    real_spawn = service_ops._spawn_owned
+    spawn_calls = {"n": 0}
+
+    async def _fail_second(
+        state, upstream_url, identity, gw_port, gw_pid, reclaim_entry=None
+    ):
+        spawn_calls["n"] += 1
+        if spawn_calls["n"] == 2:
+            raise typer.Exit(1)
+        return await real_spawn(
+            state,
+            upstream_url,
+            identity,
+            gw_port,
+            gw_pid,
+            reclaim_entry=reclaim_entry,
+        )
+
+    with patch("manifold.paths.PID_DIR", tmp_path):
+        with patch("manifold.paths.is_port_in_use", return_value=False):
+            with ExitStack() as stack:
+                _patch_up_runtime(stack)
+                stack.enter_context(patch("manifold.process.stop_service", stop_mock))
+                stack.enter_context(
+                    patch(
+                        "manifold.service_ops._spawn_owned",
+                        side_effect=_fail_second,
+                    )
+                )
+                result = runner.invoke(app, ["up", "--config", str(config_file)])
+        # Registry assertions stay INSIDE the PID_DIR patch: outside it they
+        # would read the real live state in ~/.manifold/run.
+        assert result.exit_code == 1
+        assert spawn_calls["n"] == 2  # failed on the SECOND service
+        stop_mock.assert_awaited_once()
+        assert stop_mock.await_args.args[0].config.name == "svc-a"  # the FIRST one
+        assert registry.read_lease(9000) is None
+        assert registry.list_service_entries() == []
+
+
+# --- crash-path rewiring (contained M1 items) --------------------------------
+
+
+def _patch_up_runtime_with(
+    stack: ExitStack,
+    captured: dict,
+    start_mock: AsyncMock,
+    server_cls: type,
+    capture_crash: bool = False,
+) -> None:
+    """Like _patch_up_runtime but with a custom Server class and app capture."""
+    stack.enter_context(
+        patch("manifold.cli.wait_for_services_ready", new_callable=AsyncMock)
+    )
+    stack.enter_context(patch("manifold.cli.health_loop", new_callable=AsyncMock))
+    stack.enter_context(patch("manifold.cli.watch_config", new_callable=AsyncMock))
+    stack.enter_context(patch("manifold.cli.uvicorn.Server", new=server_cls))
+    stack.enter_context(patch("manifold.process.start_service", start_mock))
+    real_create_app = cli_module.create_app
+
+    def _capture_create_app(**kwargs):
+        captured["pipeline"] = kwargs["pipeline"]
+        return real_create_app(**kwargs)
+
+    stack.enter_context(
+        patch("manifold.cli.create_app", side_effect=_capture_create_app)
+    )
+    if capture_crash:
+        stack.enter_context(
+            patch(
+                "manifold.process.set_on_crash",
+                side_effect=lambda cb: captured.update(crash=cb),
+            )
+        )
+
+
+def test_auto_restart_rewires_around_dead_dependency(tmp_path: Path, monkeypatch):
+    """c1: the crashed service's restart must compute its upstream from the
+    currently-LIVE services — restarting into a dependency that is itself
+    still dead used to guarantee an instant second failure."""
+    monkeypatch.setattr(cli_module, "_BASE_RESTART_DELAY", 0.01)
+
+    p = tmp_path / "manifold.yaml"
+    p.write_text(
+        """\
+gateway:
+  host: 127.0.0.1
+  port: 9000
+pipeline:
+  - name: svc-a
+    directory: /tmp
+    command: "echo a --port {port} --upstream {upstream}"
+    port: 7001
+    health: /h
+    upstream_via: cli_arg
+    enabled: true
+  - name: svc-b
+    directory: /tmp
+    command: "echo b --port {port} --upstream {upstream}"
+    port: 7002
+    health: /h
+    upstream_via: cli_arg
+    enabled: true
+  - name: svc-c
+    directory: /tmp
+    command: "echo c --port {port} --upstream {upstream}"
+    port: 7003
+    health: /h
+    upstream_via: cli_arg
+    enabled: true
+"""
+    )
+    captured: dict = {}
+    start_mock = AsyncMock()
+
+    class _CrashyServer(_FakeUvicornServer):
+        async def main_loop(self):
+            pipeline = captured["pipeline"]
+            # start_service is mocked, so statuses never left STOPPED; set the
+            # realistic mid-flight world: svc-c healthy, svc-b dead earlier,
+            # and now svc-a crashes too.
+            pipeline.get_service("svc-c").status = ServiceStatus.HEALTHY
+            pipeline.get_service("svc-b").status = ServiceStatus.UNHEALTHY
+            state_a = pipeline.get_service("svc-a")
+            state_a.status = ServiceStatus.UNHEALTHY
+            captured["crash"](state_a)
+            for _ in range(200):
+                if start_mock.await_count >= 4:  # 3 initial spawns + 1 restart
+                    break
+                await asyncio.sleep(0.01)
+
+    with patch("manifold.paths.PID_DIR", tmp_path):
+        with patch("manifold.paths.is_port_in_use", return_value=False):
+            with ExitStack() as stack:
+                _patch_up_runtime_with(
+                    stack, captured, start_mock, _CrashyServer, capture_crash=True
+                )
+                result = runner.invoke(app, ["up", "--config", str(p)])
+    assert result.exit_code == 0, result.output
+    assert start_mock.await_count == 4
+    restarted_state, upstream_url = start_mock.await_args_list[3].args
+    assert restarted_state.config.name == "svc-a"
+    # upstream must be svc-C (live), NOT svc-B (the dead dependency)
+    assert upstream_url == "http://127.0.0.1:7003"
+
+
+def test_adopted_crash_rewires_but_does_not_stop(tmp_path: Path):
+    """c2: an adopted service's crash performs the bookkeeping rewire so OUR
+    chain routes around it, while kill/restart stay with the owner gateway
+    (I1) — before the fix the handler returned before rewiring."""
+    config_file = _config_file_two_services(tmp_path)
+    cfg = load_config(config_file)
+    identity_a = registry.compute_service_identity(
+        cfg.pipeline[0], "http://127.0.0.1:7002"
+    )
+    captured: dict = {}
+    start_mock = AsyncMock()
+    stop_mock = AsyncMock()
+
+    class _CrashyServer(_FakeUvicornServer):
+        async def main_loop(self):
+            pipeline = captured["pipeline"]
+            state_a = pipeline.get_service("svc-a")
+            assert state_a.adopted is True
+            # start_service is mocked → b never left STOPPED; a healthy
+            # svc-b is what the entry hop should fall through to.
+            pipeline.get_service("svc-b").status = ServiceStatus.HEALTHY
+            state_a.status = ServiceStatus.UNHEALTHY
+            captured["crash"](state_a)
+            await asyncio.sleep(0.05)
+
+    with patch("manifold.paths.PID_DIR", tmp_path):
+        # svc-a runs, owned by ANOTHER gateway (:9001) → this `up` adopts it.
+        # (Inside the PID_DIR patch — never write to the real ~/.manifold/run.)
+        registry.write_service_entry(
+            {
+                "schema_version": 1,
+                "identity": identity_a,
+                "name": "svc-a",
+                "directory": "/tmp",
+                "command": "echo a --port 7001 --upstream http://127.0.0.1:7002",
+                "port": 7001,
+                "upstream": "http://127.0.0.1:7002",
+                "pid": os.getpid(),
+                "pgid": os.getpid(),
+                "owner_port": 9001,
+                "owner_pid": os.getpid(),
+                "started_at": 0.0,
+            }
+        )
+        with patch("manifold.paths.is_port_in_use", return_value=False):
+            with ExitStack() as stack:
+                _patch_up_runtime_with(
+                    stack, captured, start_mock, _CrashyServer, capture_crash=True
+                )
+                stack.enter_context(patch("manifold.process.stop_service", stop_mock))
+                result = runner.invoke(app, ["up", "--config", str(config_file)])
+        # Registry assertions stay INSIDE the PID_DIR patch (live-state leak).
+        assert result.exit_code == 0, result.output
+        # bypass state updated: entry hop now skips the dead adopted service
+        pipeline = captured["pipeline"]
+        assert pipeline.get_service("svc-a").status == ServiceStatus.UNHEALTHY
+        assert get_entry_url(pipeline, GatewayConfig()) == "http://127.0.0.1:7002"
+        # no kill of the adopted service — teardown only ever stopped svc-b
+        stopped_names = [c.args[0].config.name for c in stop_mock.await_args_list]
+        assert "svc-a" not in stopped_names
+        # owner's registry entry untouched
+        entry = registry.read_service_entry(identity_a)
+        assert entry is not None
+        assert entry["owner_port"] == 9001
+
+
+# --- gateway kill identity check (M6) -----------------------------------------
+
+
+def test_down_live_foreign_pid_not_signaled(tmp_path: Path):
+    """M6: a stale pid file pointing at a LIVE but non-manifold process must
+    not be signaled (pid reuse) — files are still cleaned up."""
+    pid_file = tmp_path / "manifold-9000.pid"
+    pid_file.write_text(str(os.getpid()))
+    (tmp_path / "manifold-9000.port").write_text("127.0.0.1:9000")
+    ps_mock = MagicMock(returncode=0, stdout="vim notes.txt")
+    with patch("manifold.paths.PID_DIR", tmp_path):
+        with patch("manifold.registry.pid_alive", lambda pid: pid == os.getpid()):
+            with patch("manifold.cli.subprocess.run", return_value=ps_mock) as run_mock:
+                kill_mock = MagicMock()
+                with patch("manifold.cli.os.kill", kill_mock):
+                    with patch(
+                        "manifold.cli._lsof_ports_for_config",
+                        MagicMock(return_value=[]),
+                    ):
+                        _down_one(9000, None)
+    run_mock.assert_called_once()  # the identity check consulted ps
+    kill_mock.assert_not_called()  # never signal a foreign process
+    assert not pid_file.exists()  # files still cleaned up
+    assert not (tmp_path / "manifold-9000.port").exists()
+
+
+def test_down_live_own_pid_signaled(tmp_path: Path):
+    """M6: a live gateway whose ps command mentions manifold IS signaled."""
+    pid_file = tmp_path / "manifold-9000.pid"
+    pid_file.write_text(str(os.getpid()))
+    (tmp_path / "manifold-9000.port").write_text("127.0.0.1:9000")
+    ps_mock = MagicMock(
+        returncode=0,
+        stdout=f"python .venv/bin/manifold up --port 9000  # {os.getpid()}",
+    )
+    # pid_alive: gate check -> alive, then the post-SIGTERM poll sees it gone.
+    alive = iter([True, False, False])
+    with patch("manifold.paths.PID_DIR", tmp_path):
+        with patch("manifold.registry.pid_alive", lambda pid: next(alive)):
+            with patch("manifold.cli.subprocess.run", return_value=ps_mock):
+                kill_mock = MagicMock()
+                with patch("manifold.cli.os.kill", kill_mock):
+                    with patch(
+                        "manifold.cli._lsof_ports_for_config",
+                        MagicMock(return_value=[]),
+                    ):
+                        _down_one(9000, None)
+    kill_mock.assert_called_once_with(os.getpid(), signal.SIGTERM)
+
+
+def test_down_pid_reuse_skip_logged(tmp_path: Path, caplog):
+    """The skip must be visible: a warning naming the pid-reuse suspicion."""
+    import logging
+
+    (tmp_path / "manifold-9000.pid").write_text(str(os.getpid()))
+    ps_mock = MagicMock(returncode=0, stdout="nginx: master process")
+    with caplog.at_level(logging.WARNING, logger="manifold"):
+        with patch("manifold.paths.PID_DIR", tmp_path):
+            with patch("manifold.registry.pid_alive", lambda pid: pid == os.getpid()):
+                with patch("manifold.cli.subprocess.run", return_value=ps_mock):
+                    with patch(
+                        "manifold.cli._lsof_ports_for_config",
+                        MagicMock(return_value=[]),
+                    ):
+                        _down_one(9000, None)
+    assert any(
+        "does not look like a manifold gateway" in r.getMessage()
+        for r in caplog.records
+    )

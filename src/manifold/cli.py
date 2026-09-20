@@ -45,6 +45,11 @@ app = typer.Typer(
 
 log = logging.getLogger("manifold")
 
+# Auto-restart backoff for crashed services (exponential, capped).  Module
+# level so tests can shrink the base delay instead of waiting it out.
+_BASE_RESTART_DELAY = 2.0
+_MAX_RESTART_DELAY = 60.0
+
 
 def _maybe_prompt_gateway_startup_health(raw: dict) -> None:
     """Optionally merge gateway.startup_health_* keys into *raw* (mutates in place)."""
@@ -260,12 +265,22 @@ async def _run_pipeline(
 
     # Register crash callback: rewire chain, then schedule auto-restart
     _restart_delays: dict[str, float] = {}
-    _MAX_RESTART_DELAY = 60.0
-    _BASE_RESTART_DELAY = 2.0
 
     def _handle_crash(state: ServiceState) -> None:
-        # Adopted services belong to another gateway — never touch them (I1).
         if state.adopted:
+            # I1: kill/restart of an adopted service belongs to its owner
+            # gateway.  But our chain must still route around the corpse, so
+            # do the bookkeeping rewire (in-memory upstreams + statuses) and
+            # leave recovery to the owner.  No registry writes: the entry
+            # describes the owner's process, and the owner's own crash path
+            # or a sweep removes it (I2).
+            log.warning(
+                "Adopted service '%s' (owner gateway :%s) crashed — rewiring "
+                "around it; recovery belongs to its owner",
+                state.config.name,
+                state.owner_port,
+            )
+            rewire_around(pipeline, cfg.gateway)
             return
         name = state.config.name
         log.warning("Service '%s' crashed — rewiring chain to bypass it", name)
@@ -282,12 +297,21 @@ async def _run_pipeline(
             await asyncio.sleep(delay)
             if state.status == ServiceStatus.STOPPED:
                 return  # user explicitly stopped it
-            # Re-compute correct upstream from the *current* pipeline state,
-            # not the original config (which may be stale after hot-reload).
-            current_services = [s.config for s in pipeline.services]
-            upstreams = compute_upstreams(
-                current_services, cfg.gateway.fallback_upstream
-            )
+            # Reconstruct the chain the way the health loop's bypass sees it
+            # (live services only), but keep the crashed service in its own
+            # slot: its upstream must be the next LIVE service after it.  The
+            # old code computed from the full enabled list and happily
+            # restarted into a dependency that was itself still dead.
+            live = [
+                s.config
+                for s in pipeline.services
+                if s.config.enabled
+                and (
+                    s is state
+                    or s.status not in (ServiceStatus.STOPPED, ServiceStatus.UNHEALTHY)
+                )
+            ]
+            upstreams = compute_upstreams(live, cfg.gateway.fallback_upstream)
             upstream_url = upstreams.get(name, cfg.gateway.fallback_upstream)
             svc = state.config
             if svc.upstream_via == UpstreamVia.CONFIG_FILE:
@@ -345,19 +369,31 @@ async def _run_pipeline(
     registry.write_lease(gw_port, gw_pid, identities, isolated)
 
     # Start services in order: adopt running ones, reclaim dead-owner ones,
-    # spawn the rest.
-    for state, decision, upstream_url, payload, identity in plans:
-        if decision == "adopt":
-            service_ops._adopt_from_entry(state, payload, upstream_url)
-        else:
-            await service_ops._spawn_owned(
-                state,
-                upstream_url,
-                identity,
-                gw_port,
-                gw_pid,
-                reclaim_entry=payload if decision == "promote" else None,
-            )
+    # spawn the rest.  This loop sits inside its own try so a mid-loop
+    # failure (typer.Exit when a port is taken while spawning, or anything
+    # else) runs the same _shutdown_pipeline teardown as the runtime
+    # finally-block below.  Without this guard, a failure on service N left
+    # services 1..N-1 running with a lease written and nobody cleaning up.
+    try:
+        for state, decision, upstream_url, payload, identity in plans:
+            if decision == "adopt":
+                service_ops._adopt_from_entry(state, payload, upstream_url)
+            else:
+                await service_ops._spawn_owned(
+                    state,
+                    upstream_url,
+                    identity,
+                    gw_port,
+                    gw_pid,
+                    reclaim_entry=payload if decision == "promote" else None,
+                )
+    except BaseException:
+        log.warning("Startup failed mid-spawn — tearing down the half-started pipeline")
+        try:
+            await _shutdown_pipeline(pipeline, gw_port, gw_pid)
+        except Exception:
+            log.exception("Error stopping pipeline services after failed startup")
+        raise
 
     # The identity set is final now — refresh the lease.
     registry.write_lease(gw_port, gw_pid, identities, isolated)
@@ -758,6 +794,36 @@ def _lsof_ports_for_config(config_path: str | None) -> list[int]:
     return pids
 
 
+def _gateway_pid_looks_like_manifold(pid: int) -> bool:
+    """Best-effort identity check before signaling a gateway pid (M6).
+
+    Pids are recycled: a stale ``manifold-<port>.pid`` can point at a process
+    that has nothing to do with manifold, and a blind SIGTERM kills an
+    innocent process.  Reads the command line via ``ps`` and accepts when it
+    mentions manifold or uvicorn (service kills verify the pgid per I4; a
+    gateway pid has no such second check, so this is its weaker analogue).
+
+    Fails OPEN when ``ps`` itself is unusable (missing/broken): the historic
+    behavior was an unconditional signal, and a broken ``ps`` should not
+    break ``down``.
+    """
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return True
+    if result.returncode != 0:
+        # ps says there is no such process (it likely exited since the
+        # pid_alive check) — nothing to signal either way.
+        return False
+    command = result.stdout.lower()
+    return "manifold" in command or "uvicorn" in command
+
+
 def _down_one(port: int, config_path: str | None) -> None:
     """Stop the gateway on *port* and reap its registry-tracked services.
 
@@ -782,24 +848,42 @@ def _down_one(port: int, config_path: str | None) -> None:
         except ValueError:
             gw_pid = None
 
-    # 2. Gateway signal: SIGTERM, poll up to 5s, SIGKILL if it hangs.
+    # 2. Gateway signal: SIGTERM, poll up to 5s, SIGKILL if it hangs — but
+    #    only after a best-effort identity check: pid files outlive their
+    #    gateway and pids get recycled, and a blind SIGTERM can hit an
+    #    unrelated process.
     if gw_pid is not None and registry.pid_alive(gw_pid):
-        try:
-            os.kill(gw_pid, signal.SIGTERM)
-            typer.echo(f"Sent SIGTERM to manifold on port {port} (pid={gw_pid})")
-        except PermissionError:
-            typer.echo(f"Permission denied sending signal to pid={gw_pid}", err=True)
-            raise typer.Exit(1)
-        deadline = time.monotonic() + 5.0
-        while registry.pid_alive(gw_pid) and time.monotonic() < deadline:
-            time.sleep(0.1)
-        if registry.pid_alive(gw_pid):
-            log.info("Gateway %d still alive after SIGTERM — SIGKILL", port)
+        if not _gateway_pid_looks_like_manifold(gw_pid):
+            log.warning(
+                "Process %d on port %d does not look like a manifold gateway "
+                "(command names neither manifold nor uvicorn) — pid reuse? "
+                "Skipping the signal; cleaning up stale files only.",
+                gw_pid,
+                port,
+            )
+            typer.echo(
+                f"Process {gw_pid} on port {port} does not look like a manifold "
+                "gateway (pid reuse?) — skipping signal, cleaning stale files"
+            )
+        else:
             try:
-                os.kill(gw_pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            time.sleep(0.5)
+                os.kill(gw_pid, signal.SIGTERM)
+                typer.echo(f"Sent SIGTERM to manifold on port {port} (pid={gw_pid})")
+            except PermissionError:
+                typer.echo(
+                    f"Permission denied sending signal to pid={gw_pid}", err=True
+                )
+                raise typer.Exit(1)
+            deadline = time.monotonic() + 5.0
+            while registry.pid_alive(gw_pid) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if registry.pid_alive(gw_pid):
+                log.info("Gateway %d still alive after SIGTERM — SIGKILL", port)
+                try:
+                    os.kill(gw_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                time.sleep(0.5)
     elif gw_pid is not None:
         typer.echo(f"Process {gw_pid} not found — cleaning up stale PID file.")
 
