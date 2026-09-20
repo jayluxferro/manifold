@@ -261,27 +261,36 @@ _PRIVACY_CRITICAL_FRAGMENTS = ("redactor",)
 _entry_bypass_warned: set[str] = set()
 
 
-def get_entry_url(pipeline: PipelineState, gateway: GatewayConfig) -> str | None:
-    """Get the URL the gateway should forward requests to.
+def get_entry_route(
+    pipeline: PipelineState, gateway: GatewayConfig
+) -> tuple[str | None, list[str]]:
+    """Resolve the entry URL and the enabled services this request bypasses.
 
-    Returns the first healthy/starting service, or None if the entire
-    pipeline is down.  The gateway must never bypass the pipeline and send
-    directly to the cloud — if no service is available, requests should
-    fail with 503.
+    Returns ``(entry_url, bypassed)``: the first healthy/starting service's
+    URL, plus the names of every enabled-but-down service skipped ahead of
+    it.  ``bypassed`` is per-request truth — the gateway stamps it onto the
+    response as ``x-manifold-bypassed`` so a bypass is visible on the traffic
+    itself, not only in logs.  Empty when the chain is fully servable (or
+    fully down: no route means nothing was bypassed *to*).
+
+    The gateway must never bypass the pipeline and send directly to the
+    cloud — if no service is available, requests should fail with 503.
 
     Skipping an enabled-but-down service is a real traffic bypass (the only
     one manifold performs — mid-chain deaths rely on auto-restart), so when
     the skipped service is a redactor we warn loudly about the privacy
     degradation: raw PII flows until it is restored.
     """
+    bypassed: list[str] = []
     for state in pipeline.services:
         if not state.config.enabled:
             continue
         if state.status in (ServiceStatus.HEALTHY, ServiceStatus.STARTING):
             _entry_bypass_warned.discard(state.config.name)
-            return f"http://127.0.0.1:{state.config.port}"
+            return f"http://127.0.0.1:{state.config.port}", bypassed
         # Enabled but not servable -> bypassed at the entry hop.
         name = state.config.name
+        bypassed.append(name)
         if (
             any(frag in name.lower() for frag in _PRIVACY_CRITICAL_FRAGMENTS)
             and name not in _entry_bypass_warned
@@ -293,4 +302,10 @@ def get_entry_url(pipeline: PipelineState, gateway: GatewayConfig) -> str | None
                 "restore-on-response is skipped",
                 name,
             )
-    return None
+    return None, bypassed
+
+
+def get_entry_url(pipeline: PipelineState, gateway: GatewayConfig) -> str | None:
+    """Get the URL the gateway should forward requests to (see get_entry_route)."""
+    url, _ = get_entry_route(pipeline, gateway)
+    return url

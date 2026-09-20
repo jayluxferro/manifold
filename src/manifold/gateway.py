@@ -6,6 +6,7 @@ import logging
 import os
 from collections.abc import Callable
 from contextlib import asynccontextmanager
+from urllib.parse import urlparse
 
 import httpx
 from starlette.applications import Starlette
@@ -50,6 +51,10 @@ _gateway_config: GatewayConfig | None = None
 _http_client: httpx.AsyncClient | None = None
 # Callbacks injected by the orchestrator
 _get_entry_url: Callable[[], str | None] | None = None
+# Optional richer route callback: (entry_url, names bypassed at the entry
+# hop).  When absent the gateway falls back to _get_entry_url and simply
+# cannot report entry bypasses.
+_get_entry_route: Callable[[], tuple[str | None, list[str]]] | None = None
 _get_stats: Callable[[], dict] | None = None
 _get_health: Callable[[], dict] | None = None
 
@@ -60,14 +65,47 @@ def _target_url() -> str | None:
     Returns None when no pipeline service is available — the gateway must
     never bypass the pipeline and send directly to the cloud API.
     """
+    if _get_entry_route is not None:
+        return _get_entry_route()[0]
     if _get_entry_url is not None:
         return _get_entry_url()
     return None
 
 
+def _shimmed_service_names(target: str | None) -> list[str]:
+    """Names of services this request's path is served THROUGH a crash shim.
+
+    A shim binds a dead mid-chain service's port and forwards raw bytes to
+    the next live service, so a shim at or after the entry hop is in this
+    request's path (each predecessor's baked upstream points at the shimmed
+    port — that is why the shim exists).  If the entry hop cannot be located,
+    report every shim: over-announcing a degraded chain beats silence.
+    """
+    shims = shim.all_shims()
+    if _pipeline is None or not shims:
+        return []
+    start = 0
+    entry_port = urlparse(target).port if target else None
+    for i, state in enumerate(_pipeline.services):
+        if state.config.enabled and state.config.port == entry_port:
+            start = i
+            break
+    return [
+        state.config.name
+        for i, state in enumerate(_pipeline.services)
+        if i >= start and state.config.enabled and state.config.port in shims
+    ]
+
+
 async def _proxy(request: Request) -> Response:
     """Forward an incoming request to the first pipeline service."""
-    target = _target_url()
+    # Per-request route resolution.  The richer callback also yields the
+    # names of services bypassed at the entry hop for THIS request.
+    if _get_entry_route is not None:
+        target, entry_bypassed = _get_entry_route()
+    else:
+        target = _target_url()
+        entry_bypassed = []
     if target is None:
         return JSONResponse(
             {
@@ -78,6 +116,17 @@ async def _proxy(request: Request) -> Response:
             },
             status_code=503,
         )
+
+    # Per-request bypass observability: a redactor-out window (or any other
+    # bypass) must be visible on the traffic itself, not only in logs.  Both
+    # headers ride every response this request produces — proxied, streamed,
+    # or error — and are absent on a healthy chain.
+    extra_headers: dict[str, str] = {}
+    if entry_bypassed:
+        extra_headers["x-manifold-bypassed"] = ",".join(entry_bypassed)
+    shimmed = _shimmed_service_names(target)
+    if shimmed:
+        extra_headers["x-manifold-shim"] = ",".join(shimmed)
 
     url = f"{target}{request.url.path}"
     if request.url.query:
@@ -154,6 +203,7 @@ async def _proxy(request: Request) -> Response:
                 }
             },
             status_code=502,
+            headers=extra_headers,
         )
     except httpx.TimeoutException:
         log.error(
@@ -175,12 +225,16 @@ async def _proxy(request: Request) -> Response:
                 }
             },
             status_code=504,
+            headers=extra_headers,
         )
 
     resp_headers = dict(upstream_resp.headers)
     resp_headers.pop("transfer-encoding", None)
     resp_headers.pop("content-length", None)
     resp_headers.pop("content-encoding", None)
+    # Bypass/shim stamps ride the proxied response too — set BEFORE the body
+    # streams so both streaming and buffered paths carry them.
+    resp_headers.update(extra_headers)
 
     content_type = upstream_resp.headers.get("content-type", "")
     is_streaming = "text/event-stream" in content_type
@@ -296,14 +350,16 @@ def create_app(
     get_entry_url: Callable[[], str | None] | None = None,
     get_stats: Callable[[], dict] | None = None,
     get_health: Callable[[], dict] | None = None,
+    get_entry_route: Callable[[], tuple[str | None, list[str]]] | None = None,
 ) -> Starlette:
     """Create the Starlette ASGI gateway application."""
     global _pipeline, _gateway_config, _http_client
-    global _get_entry_url, _get_stats, _get_health
+    global _get_entry_url, _get_entry_route, _get_stats, _get_health
 
     _pipeline = pipeline
     _gateway_config = gateway_config
     _get_entry_url = get_entry_url
+    _get_entry_route = get_entry_route
     _get_stats = get_stats
     _get_health = get_health
 

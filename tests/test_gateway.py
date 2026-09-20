@@ -305,3 +305,173 @@ def test_session_scope_does_not_stamp_bucket_header():
 
     assert resp.status_code == 200
     assert "x-hivemind-agent-id" not in captured["headers"]
+
+
+# --- per-request bypass observability (x-manifold-bypassed / x-manifold-shim)
+
+
+def _two_service_pipeline():
+    """a (down) in front of b (healthy) — the classic redactor-out shape."""
+    svc_a = ServiceConfig(
+        name="llm-redactor",
+        directory="/tmp",
+        command="echo",
+        port=7001,
+        health="/h",
+        upstream_via=UpstreamVia.CLI_ARG,
+    )
+    svc_b = ServiceConfig(
+        name="hivemind",
+        directory="/tmp",
+        command="echo",
+        port=7002,
+        health="/h",
+        upstream_via=UpstreamVia.CLI_ARG,
+    )
+    a = ServiceState(config=svc_a, status=ServiceStatus.UNHEALTHY)
+    b = ServiceState(config=svc_b, status=ServiceStatus.HEALTHY)
+    a.upstream_url = "http://127.0.0.1:7002"
+    b.upstream_url = "https://api.anthropic.com"
+    return PipelineState(services=[a, b])
+
+
+def test_entry_bypass_sets_bypassed_header():
+    """A request whose entry hop skipped a down service says so on the
+    response — silent degradation is the worst kind."""
+    app = create_app(
+        pipeline=_two_service_pipeline(),
+        gateway_config=GatewayConfig(),
+        get_entry_url=lambda: "http://127.0.0.1:7002",
+        get_entry_route=lambda: ("http://127.0.0.1:7002", ["llm-redactor"]),
+    )
+
+    with TestClient(app) as c:
+        _install_capture_transport()
+        resp = c.post("/v1/messages", json={"model": "test"})
+
+    assert resp.status_code == 200
+    assert resp.headers["x-manifold-bypassed"] == "llm-redactor"
+
+
+def test_healthy_chain_has_no_bypass_headers():
+    app = create_app(
+        pipeline=_make_pipeline(),
+        gateway_config=GatewayConfig(),
+        get_entry_url=lambda: "http://127.0.0.1:7001",
+        get_entry_route=lambda: ("http://127.0.0.1:7001", []),
+    )
+
+    with TestClient(app) as c:
+        _install_capture_transport()
+        resp = c.post("/v1/messages", json={"model": "test"})
+
+    assert resp.status_code == 200
+    assert "x-manifold-bypassed" not in resp.headers
+    assert "x-manifold-shim" not in resp.headers
+
+
+def test_streaming_response_carries_bypass_header():
+    """The stamp is set before body streaming starts, so SSE responses carry
+    it too."""
+
+    def sse_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=b"data: hi\n\n",
+        )
+
+    app = create_app(
+        pipeline=_two_service_pipeline(),
+        gateway_config=GatewayConfig(),
+        get_entry_url=lambda: "http://127.0.0.1:7002",
+        get_entry_route=lambda: ("http://127.0.0.1:7002", ["llm-redactor"]),
+    )
+
+    with TestClient(app) as c:
+        import manifold.gateway as gw_mod
+
+        gw_mod._http_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(sse_handler)
+        )
+        resp = c.post("/v1/messages", json={"model": "test"})
+
+    assert resp.status_code == 200
+    assert resp.headers["x-manifold-bypassed"] == "llm-redactor"
+
+
+def test_shimmed_service_in_path_sets_shim_header():
+    """Serving through a crash shim (gateway-local state) is stamped with the
+    shimmed service's name."""
+    import manifold.shim as shim
+    from manifold.shim import ShimHandle
+
+    pipeline = _two_service_pipeline()
+    pipeline.services[0].status = ServiceStatus.HEALTHY  # entry is now "a"
+    pipeline.services[1].status = ServiceStatus.UNHEALTHY
+    app = create_app(
+        pipeline=pipeline,
+        gateway_config=GatewayConfig(),
+        get_entry_url=lambda: "http://127.0.0.1:7001",
+        get_entry_route=lambda: ("http://127.0.0.1:7001", []),
+    )
+
+    shim._shims[7002] = ShimHandle(  # b's port is a crash shim
+        listen_port=7002, target_host="127.0.0.1", target_port=7003
+    )
+    try:
+        with TestClient(app) as c:
+            _install_capture_transport()
+            resp = c.post("/v1/messages", json={"model": "test"})
+        assert resp.status_code == 200
+        assert resp.headers["x-manifold-shim"] == "hivemind"
+    finally:
+        shim._shims.pop(7002, None)
+
+
+def test_shim_before_entry_is_not_reported():
+    """A shim on a service the entry hop already skips is not in this
+    request's path."""
+    import manifold.shim as shim
+    from manifold.shim import ShimHandle
+
+    app = create_app(
+        pipeline=_two_service_pipeline(),  # entry resolves to b (index 1)
+        gateway_config=GatewayConfig(),
+        get_entry_url=lambda: "http://127.0.0.1:7002",
+        get_entry_route=lambda: ("http://127.0.0.1:7002", ["llm-redactor"]),
+    )
+
+    shim._shims[7001] = ShimHandle(  # shimmed BEFORE the entry hop
+        listen_port=7001, target_host="127.0.0.1", target_port=7003
+    )
+    try:
+        with TestClient(app) as c:
+            _install_capture_transport()
+            resp = c.post("/v1/messages", json={"model": "test"})
+        assert resp.status_code == 200
+        assert "x-manifold-shim" not in resp.headers
+    finally:
+        shim._shims.pop(7001, None)
+
+
+def test_error_response_carries_bypass_header():
+    """A 502 from a bypassed chain is exactly when you're debugging — the
+    stamp rides error responses too."""
+    import manifold.gateway as gw_mod
+
+    app = create_app(
+        pipeline=_two_service_pipeline(),
+        gateway_config=GatewayConfig(),
+        get_entry_url=lambda: "http://127.0.0.1:7002",
+        get_entry_route=lambda: ("http://127.0.0.1:7002", ["llm-redactor"]),
+    )
+
+    with TestClient(app) as c:
+        orig_client = gw_mod._http_client
+        mock_send = AsyncMock(side_effect=httpx.ConnectError("Connection refused"))
+        orig_client.send = mock_send  # type: ignore[method-assign]
+
+        resp = c.post("/v1/messages", json={"model": "test"})
+        assert resp.status_code == 502
+        assert resp.headers["x-manifold-bypassed"] == "llm-redactor"

@@ -12,6 +12,7 @@ from manifold.chain import (
     _deep_get,
     _deep_set,
     compute_upstreams,
+    get_entry_route,
     get_entry_url,
     patch_service_config,
     resolve_command,
@@ -322,3 +323,55 @@ class TestEntryBypassPrivacyWarning:
         with caplog.at_level(logging.WARNING, logger="manifold.chain"):
             assert get_entry_url(pipeline, GatewayConfig()) == "http://127.0.0.1:7002"
         assert not [r for r in caplog.records if "privacy" in r.getMessage().lower()]
+
+
+class TestGetEntryRoute:
+    """get_entry_route is get_entry_url plus the per-request bypass names the
+    gateway stamps onto responses as x-manifold-bypassed."""
+
+    def test_returns_url_and_bypassed_names(self):
+        pipeline = PipelineState(
+            services=[
+                ServiceState(config=_svc("a", 7001), status=ServiceStatus.UNHEALTHY),
+                ServiceState(config=_svc("b", 7002), status=ServiceStatus.UNHEALTHY),
+                ServiceState(config=_svc("c", 7003), status=ServiceStatus.HEALTHY),
+            ]
+        )
+        url, bypassed = get_entry_route(pipeline, GatewayConfig())
+        assert url == "http://127.0.0.1:7003"
+        assert bypassed == ["a", "b"]
+
+    def test_healthy_chain_bypasses_nothing(self):
+        pipeline = PipelineState(
+            services=[
+                ServiceState(config=_svc("a", 7001), status=ServiceStatus.HEALTHY)
+            ]
+        )
+        url, bypassed = get_entry_route(pipeline, GatewayConfig())
+        assert url == "http://127.0.0.1:7001"
+        assert bypassed == []
+
+    def test_fully_down_yields_no_url_and_all_names(self):
+        pipeline = PipelineState(
+            services=[
+                ServiceState(config=_svc("a", 7001), status=ServiceStatus.STOPPED),
+                ServiceState(config=_svc("b", 7002), status=ServiceStatus.STOPPED),
+            ]
+        )
+        url, bypassed = get_entry_route(pipeline, GatewayConfig())
+        assert url is None
+        assert bypassed == ["a", "b"]
+
+    def test_disabled_services_are_not_bypasses(self):
+        pipeline = PipelineState(
+            services=[
+                ServiceState(
+                    config=_svc("a", 7001, enabled=False),
+                    status=ServiceStatus.STOPPED,
+                ),
+                ServiceState(config=_svc("b", 7002), status=ServiceStatus.HEALTHY),
+            ]
+        )
+        url, bypassed = get_entry_route(pipeline, GatewayConfig())
+        assert url == "http://127.0.0.1:7002"
+        assert bypassed == []

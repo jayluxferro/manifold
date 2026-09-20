@@ -20,6 +20,7 @@ from manifold import paths, process, registry, shim
 from manifold import service_ops
 from manifold.chain import (
     compute_upstreams,
+    get_entry_route,
     get_entry_url,
     patch_service_config,
     resolve_command,
@@ -654,6 +655,7 @@ async def _run_pipeline(
         pipeline=pipeline,
         gateway_config=cfg.gateway,
         get_entry_url=lambda: get_entry_url(pipeline, cfg.gateway),
+        get_entry_route=lambda: get_entry_route(pipeline, cfg.gateway),
         get_stats=_stats_callback,
         get_health=_health_callback,
     )

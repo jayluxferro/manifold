@@ -368,9 +368,7 @@ async def restart_service(state: ServiceState, upstream_url: str) -> None:
     called (not the internals) so patches/overrides apply; the lock is
     reentrant per task, so the nested acquisitions are no-ops here.
     """
-    await _run_locked(
-        state.config.name, lambda: _restart_unrolled(state, upstream_url)
-    )
+    await _run_locked(state.config.name, lambda: _restart_unrolled(state, upstream_url))
 
 
 async def _restart_unrolled(state: ServiceState, upstream_url: str) -> None:
