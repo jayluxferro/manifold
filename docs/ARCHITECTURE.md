@@ -75,16 +75,17 @@ for i, service in enumerate(enabled_services):
    - No file modification needed
 
 **Bypass rewiring:**
-When health monitor marks a service unhealthy:
+When a mid-chain service dies:
 ```
 Before: A → B → C → Cloud
 B goes down:
-After:  A → C → Cloud
+After:  A → B* → C → Cloud    where B* is a TCP shim on B's port forwarding to C
 ```
-- If B used config file patching: rewrite A's config to point to C's port, then signal A to reload (or restart A)
-- If B used CLI arg: restart A with updated command
-- If the first service goes down: gateway forwards directly to the second service
-- If all services go down: gateway needs a fallback (the last service's original upstream)
+- The chain wirer updates in-memory upstreams so restarts target the next LIVE service; config files are only re-patched by the gateway that owns (spawns) the process
+- A **port shim** (`shim.py`) binds B's port and relays raw bytes to C — no HTTP parsing, so SSE and chunked bodies flow untouched, and A's baked-in upstream keeps working. The shim is gateway-local ephemeral state: no registry entry, no lease
+- The shim stops the moment B respawns (`process.start_service` clears any shim on the port before spawning); if B's crash is permanent, the shim keeps the chain connected — minus B's function (see README's per-layer list)
+- If the first service goes down: the gateway re-resolves the entry hop on every request and forwards to the next live service — no shim needed
+- A *hung* service (alive but failing health) keeps its port bound, so it cannot be shimmed — it relies on auto-restart as before
 
 ### 3. Gateway (`gateway.py`)
 
@@ -293,16 +294,22 @@ adopter never touches the process itself.
 10. Gateway streams response to agent
 ```
 
-### Service Failure
+### Service Failure (mid-chain)
 ```
-1. Health monitor detects splitter :7788 is down (3 consecutive failures)
-2. Health monitor calls chain.bypass("local-splitter")
-3. Chain wirer rewrites redactor's upstream from :7788 to :8765
-4. Chain wirer restarts redactor (or signals reload if supported)
-5. Traffic now flows: Agent → Redactor → HiveMind → Cloud (splitter skipped)
-6. Health monitor detects splitter recovers
-7. Chain wirer restores original topology
+1. Splitter :7788 dies; the crash watcher (or the health monitor, after 3
+   consecutive failures) marks it down
+2. A port shim binds :7788 and forwards raw bytes to the next live service
+3. Redactor keeps POSTing to :7788 — the shim carries the traffic to
+   HiveMind; the splitter's own function (routing/compression/cache) is
+   skipped for that traffic
+4. The auto-restart respawns the splitter with an upstream that skips other
+   dead services; the shim stops just before the spawn rebinds the port
+5. If restarts keep failing, the shim stays up and the chain stays connected
 ```
+
+Entry-hop failure is different: the gateway re-resolves `get_entry_url` per
+request and enters at the next live service directly (with a privacy warning
+logged when the skipped service is the redactor).
 
 ## Error Handling
 
