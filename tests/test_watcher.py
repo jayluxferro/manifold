@@ -160,11 +160,19 @@ async def test_watcher_survives_apply_crash_and_applies_later_change(
         return await real_apply(new_cfg, *args, **kwargs)
 
     with patch("manifold.watcher._apply_config_changes", side_effect=_flaky_apply):
-        task = asyncio.create_task(
-            watch_config(
-                config_file, pipeline, gateway, interval=0.05, stop_event=stop_event
+        # The retried apply re-enables svc-a; mock the spawn — this test is
+        # about watcher survival, and a real `echo` child's asyncio transport
+        # otherwise outlives the test's event loop (unraisable __del__ later).
+        with patch("manifold.process.start_service", new_callable=AsyncMock):
+            task = asyncio.create_task(
+                watch_config(
+                    config_file,
+                    pipeline,
+                    gateway,
+                    interval=0.05,
+                    stop_event=stop_event,
+                )
             )
-        )
 
         # First change: apply crashes (KeyError above).
         await asyncio.sleep(0.12)

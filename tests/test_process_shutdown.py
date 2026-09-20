@@ -1,5 +1,6 @@
 """Tests for subprocess shutdown helpers."""
 
+import asyncio
 import signal
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -181,3 +182,122 @@ async def test_release_service_pops_without_kill_and_keeps_forwarders():
         assert state.status == ServiceStatus.STOPPED
         assert state.pid is None
         assert state.pgid is None
+
+
+# --- per-service lifecycle lock (concurrent spawn paths) ---------------------
+
+
+def _spawn_recorder(spawn_calls: list[str]):
+    """Patch factory: fake create_subprocess_shell recording each spawn."""
+
+    async def fake_spawn(cmd, **_kw):
+        proc = MagicMock()
+        proc.pid = 5000 + len(spawn_calls)
+        proc.returncode = None
+        spawn_calls.append(cmd)
+        return proc
+
+    return fake_spawn
+
+
+@pytest.mark.asyncio
+async def test_concurrent_start_service_spawns_exactly_one_child():
+    """Two overlapping spawn paths on one service (crash auto-restart vs
+    hot-reload restart) must produce ONE child: unserialized, _processes
+    keeps only the second child and the first is orphaned from tracking —
+    never killed at shutdown."""
+    spawn_calls: list[str] = []
+    state = ServiceState(
+        config=ServiceConfig(
+            name="dup",
+            directory="/tmp",
+            command="echo --upstream {upstream}",
+            port=17003,
+            health="/healthz",
+        )
+    )
+    with (
+        patch.object(mp, "_use_killpg", return_value=False),
+        patch(
+            "manifold.process.asyncio.create_subprocess_shell",
+            side_effect=_spawn_recorder(spawn_calls),
+        ),
+        patch("manifold.process.setup_service_log", return_value=None),
+        patch(
+            "manifold.process.asyncio.create_task",
+            side_effect=lambda coro: coro.close(),
+        ),
+        patch.dict(mp._processes, {}, clear=True),
+        patch.dict(mp._log_tasks, {}, clear=True),
+        patch.dict(mp._service_locks, {}, clear=True),
+    ):
+        await asyncio.gather(
+            mp.start_service(state, "http://127.0.0.1:1"),
+            mp.start_service(state, "http://127.0.0.1:2"),
+        )
+        assert len(spawn_calls) == 1
+        assert list(mp._processes) == ["dup"]
+
+
+@pytest.mark.asyncio
+async def test_restart_service_holds_lock_across_stop_and_start():
+    """A restart's stop and start are one critical section, and a concurrent
+    plain start loses cleanly: it waits out the whole restart (stop → sleep →
+    spawn) and then adopts the running child instead of spawning a second
+    one.  Unserialized, it would spawn during the restart's stop window and
+    the restart would kill that child and spawn another."""
+    order: list[str] = []
+    state = ServiceState(
+        config=ServiceConfig(
+            name="dup",
+            directory="/tmp",
+            command="echo --upstream {upstream}",
+            port=17003,
+            health="/healthz",
+        )
+    )
+    slow_proc = MagicMock()
+    slow_proc.pid = 111
+
+    async def slow_wait():
+        await asyncio.sleep(0.05)
+        return 0
+
+    slow_proc.wait = slow_wait
+
+    async def labeled_spawn(cmd, **_kw):
+        order.append("restart" if ":2" in cmd else "start")
+        proc = MagicMock()
+        proc.pid = 5000 + len(order)
+        proc.returncode = None
+        return proc
+
+    with (
+        patch.object(mp, "_use_killpg", return_value=False),
+        patch(
+            "manifold.process.asyncio.create_subprocess_shell",
+            side_effect=labeled_spawn,
+        ),
+        patch("manifold.process.setup_service_log", return_value=None),
+        patch(
+            "manifold.process.asyncio.create_task",
+            side_effect=lambda coro: coro.close(),
+        ),
+        patch.dict(mp._processes, {"dup": slow_proc}, clear=True),
+        patch.dict(mp._log_tasks, {}, clear=True),
+        patch.dict(mp._service_locks, {}, clear=True),
+    ):
+        # restart acquires the lock first and parks inside its slow stop
+        # (loop.create_task: the patch above swaps the module-global
+        # asyncio.create_task out from under this test otherwise)
+        restart_task = asyncio.get_running_loop().create_task(
+            mp.restart_service(state, "http://127.0.0.1:2")
+        )
+        await asyncio.sleep(0.02)
+        # waits out the restart's whole stop → sleep → spawn, then skips
+        await mp.start_service(state, "http://127.0.0.1:1")
+        await restart_task
+
+        assert order == ["restart"]  # exactly one spawn, from the restart
+        assert list(mp._processes) == ["dup"]
+        assert state.pid == 5001  # the plain start adopted the restart's child
