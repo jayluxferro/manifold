@@ -16,7 +16,7 @@ import typer
 import uvicorn
 import yaml
 
-from manifold import paths, process, registry
+from manifold import paths, process, registry, shim
 from manifold import service_ops
 from manifold.chain import (
     compute_upstreams,
@@ -33,6 +33,7 @@ from manifold.health import (
     wait_for_services_ready,
     StartupHealthTimeoutError,
 )
+from manifold.shim import ShimHandle
 from manifold.watcher import watch_config
 from manifold.models import PipelineState, ServiceState, ServiceStatus, UpstreamVia
 from manifold.stats import aggregate_stats
@@ -49,6 +50,132 @@ log = logging.getLogger("manifold")
 # level so tests can shrink the base delay instead of waiting it out.
 _BASE_RESTART_DELAY = 2.0
 _MAX_RESTART_DELAY = 60.0
+
+
+def _is_entry_service(pipeline: PipelineState, state: ServiceState) -> bool:
+    """True when *state* is the first enabled service (the gateway's entry hop)."""
+    for s in pipeline.services:
+        if not s.config.enabled:
+            continue
+        return s is state
+    return False
+
+
+def _shim_target_for(
+    pipeline: PipelineState, state: ServiceState
+) -> ServiceState | None:
+    """The next live enabled service strictly after *state*.
+
+    Same next-live rule as the crash-restart upstream computation (the c1
+    fix): services that are STOPPED or UNHEALTHY don't receive traffic, so
+    they are skipped.  Returns None when nothing live exists downstream — a
+    shim has nothing to forward into (the https fallback is unreachable from
+    a raw TCP forward: that side speaks TLS).
+    """
+    seen = False
+    for s in pipeline.services:
+        if not s.config.enabled:
+            continue
+        if s is state:
+            seen = True
+            continue
+        if seen and s.status not in (ServiceStatus.STOPPED, ServiceStatus.UNHEALTHY):
+            return s
+    return None
+
+
+async def _maybe_start_shim(
+    pipeline: PipelineState, state: ServiceState
+) -> ShimHandle | None:
+    """Shim a down service's port to the next live service (mid-chain bypass).
+
+    Skips the entry hop: get_entry_url re-resolves on every proxy request, so
+    the gateway already bypasses a dead first service per request — a shim
+    would be redundant.  Returns None (today's behavior) when there is no
+    shimmable situation: entry hop, no live downstream, port still bound (a
+    hung process keeps its listener — the shim cannot intercept it), or a
+    shim already owns the port.
+    """
+    if not state.config.enabled:
+        return None
+    if _is_entry_service(pipeline, state):
+        return None
+    target = _shim_target_for(pipeline, state)
+    if target is None:
+        return None
+    try:
+        return await shim.start_shim(
+            state.config.port,
+            "127.0.0.1",
+            target.config.port,
+            pid_at_start=state.pid,
+        )
+    except RuntimeError:
+        return None  # a shim already owns this port — nothing to do
+    except OSError as exc:
+        log.info(
+            "No shim for '%s' on port %d: %s", state.config.name, state.config.port, exc
+        )
+        return None
+
+
+def _live_shims(cfg) -> dict[str, str]:
+    """Ask the running gateway which services are currently shimmed.
+
+    Shims are ephemeral gateway state (not config or registry facts), so the
+    only honest source is the live /_manifold/config.  Unreachable gateway →
+    no shim info.
+    """
+    addr = f"{cfg.gateway.host}:{cfg.gateway.port}"
+    try:
+        with httpx.Client(timeout=2.0) as client:
+            resp = client.get(f"http://{addr}/_manifold/config")
+        if resp.status_code >= 400:
+            return {}
+        return {
+            s["name"]: s.get("shim_target") or ""
+            for s in resp.json().get("pipeline", [])
+            if s.get("shim")
+        }
+    except (httpx.HTTPError, ValueError):
+        return {}
+
+
+async def _shim_reconcile(pipeline: PipelineState) -> None:
+    """Release a shim whose dead adopted service is being respawned by its owner.
+
+    While our shim holds the port, the owner gateway's respawned process
+    cannot bind — it dies on EADDRINUSE and the owner's restart loop refreshes
+    its registry entry with each attempt.  A changed entry pid is the
+    signature of those attempts: drop the shim so the owner's NEXT attempt
+    gets the port back.  Owned services don't need this (their restart stops
+    the shim itself before spawning).
+    """
+    for state in pipeline.services:
+        if not state.adopted or state.identity is None:
+            continue
+        handle = shim.get_shim(state.config.port)
+        if handle is None or handle.pid_at_start is None:
+            continue
+        try:
+            entry = registry.read_service_entry(state.identity)
+        except Exception:
+            log.exception(
+                "Shim reconcile: failed to read entry for '%s'", state.config.name
+            )
+            continue
+        if entry is None:
+            continue
+        entry_pid = entry.get("pid")
+        if entry_pid is not None and entry_pid != handle.pid_at_start:
+            log.info(
+                "Owner gateway restarted '%s' (new pid %s) — releasing shim on "
+                "port %d so the real service can rebind",
+                state.config.name,
+                entry_pid,
+                state.config.port,
+            )
+            await shim.stop_shim(handle)
 
 
 def _maybe_prompt_gateway_startup_health(raw: dict) -> None:
@@ -294,6 +421,14 @@ async def _run_pipeline(
         log.info("Will auto-restart '%s' in %.1fs", name, delay)
 
         async def _do_restart():
+            # Protect traffic for the whole backoff window (and beyond, if
+            # restarts keep failing): shim the dead port to the next live
+            # service.  Started BEFORE the sleep so the shim start and the
+            # restart are ordered within this one task — no bind race between
+            # them; process.start_service stops the shim before respawning.
+            # If the crash is permanent the shim stays up and keeps the chain
+            # connected — minus the dead layer's function.
+            await _maybe_start_shim(pipeline, state)
             await asyncio.sleep(delay)
             if state.status == ServiceStatus.STOPPED:
                 return  # user explicitly stopped it
@@ -416,11 +551,20 @@ async def _run_pipeline(
                 "enabled": s.config.enabled,
                 "adopted": s.adopted,
                 "owner_port": s.owner_port,
+                "shim": shim.get_shim(s.config.port) is not None,
             }
         return {"services": services, "gateway": "running"}
 
     async def _on_adopted_unhealthy(state: ServiceState) -> None:
         """Reclaim an adopted service whose owner gateway died (health hook)."""
+        # Traffic protection despite I1: the shim never touches the owner's
+        # process — it only occupies the dead port and forwards.  Common case:
+        # the owner gateway restarts the service within seconds, the port is
+        # still bound, and this bind fails harmlessly.  If the owner is slow
+        # or dead the shim keeps the chain connected; when the owner's respawn
+        # eventually tries to rebind, _shim_reconcile releases the shim for it.
+        # No restart here (I1) — the process belongs to the owner gateway.
+        await _maybe_start_shim(pipeline, state)
         if await service_ops._promote_adopted(state, gw_port, gw_pid):
             current = [s.identity for s in pipeline.services if s.identity]
             registry.write_lease(gw_port, gw_pid, current, isolated)
@@ -502,6 +646,7 @@ async def _run_pipeline(
                 cfg.gateway,
                 stop_event=stop_event,
                 on_adopted_unhealthy=_on_adopted_unhealthy,
+                on_tick=lambda: _shim_reconcile(pipeline),
             )
         )
 
@@ -561,7 +706,14 @@ async def _shutdown_pipeline(
     keeps running — we just stop being its owner).  Owned services nobody
     needs anymore are stopped and their entries removed.  Adopted services
     are never touched (I1).
+
+    Crash shims are stopped first: they are gateway-local ephemeral state (no
+    registry trace, no separate process — an asyncio listener dies with this
+    process either way), but stopping them explicitly means nothing forwards
+    into services that are about to be stopped.
     """
+    await shim.stop_all_shims()
+
     other_live = registry.live_other_leases(gw_port)
     still_needed: set[str] = set()
     holder_of: dict[str, dict] = {}
@@ -631,6 +783,7 @@ def status(
         raise typer.Exit(1)
 
     upstreams = compute_upstreams(cfg.pipeline, cfg.gateway.fallback_upstream)
+    shimmed = _live_shims(cfg)
 
     typer.echo(f"Gateway: {cfg.gateway.host}:{cfg.gateway.port}")
     typer.echo(f"Fallback upstream: {cfg.gateway.fallback_upstream}")
@@ -639,10 +792,19 @@ def status(
     for svc in cfg.pipeline:
         marker = "✓" if svc.enabled else "✗"
         upstream = upstreams.get(svc.name, "N/A")
-        typer.echo(f"  [{marker}] {svc.name}")
+        if svc.name in shimmed:
+            typer.echo(f"  [{marker}] {svc.name} [SHIMMED]")
+        else:
+            typer.echo(f"  [{marker}] {svc.name}")
         typer.echo(f"      port: {svc.port}")
         typer.echo(f"      upstream: {upstream}")
         typer.echo(f"      health: http://127.0.0.1:{svc.port}{svc.health}")
+        if svc.name in shimmed:
+            typer.echo(
+                f"      SHIMMED → {shimmed[svc.name]} "
+                "(mid-chain traffic bypass while this service is down; "
+                "its function is not performed)"
+            )
         if svc.enabled and upstream != "N/A":
             entry = registry.read_service_entry(
                 registry.compute_service_identity(svc, upstream)

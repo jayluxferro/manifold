@@ -13,6 +13,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
+from manifold import shim
 from manifold.models import GatewayConfig, PipelineState
 
 log = logging.getLogger(__name__)
@@ -270,6 +271,12 @@ async def _manifold_config(request: Request) -> JSONResponse:
                 # owner_port is the gateway port that owns the processes.
                 "adopted": s.adopted,
                 "owner_port": s.owner_port,
+                # Crash-shim state: when true, this service's port is a pure
+                # TCP forwarder to shim_target (the next live service) while
+                # the real process is down — the dead layer's function is NOT
+                # performed for traffic flowing through it.
+                "shim": shim.get_shim(s.config.port) is not None,
+                "shim_target": shim.shim_target(s.config.port),
             }
         )
     return JSONResponse(

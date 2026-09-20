@@ -11,6 +11,7 @@ import sys
 import time
 from collections.abc import Callable
 
+from manifold import shim
 from manifold.chain import resolve_command
 from manifold.logs import setup_service_log
 from manifold.models import ServiceState, ServiceStatus
@@ -61,6 +62,13 @@ async def start_service(
     if not _atexit_registered:
         atexit.register(sync_kill_tracked_subprocesses)
         _atexit_registered = True
+
+    # A crash shim may still hold this port (it forwards traffic to the next
+    # live service while the real one is down).  The shim must lose the port
+    # before the real service rebinds — doing it here covers every spawn path
+    # (crash restart, hot-reload restart/enable, adoption promotion), so no
+    # caller can race the shim's listener.
+    await shim.stop_shim_for_port(state.config.port)
 
     # A fresh spawn is always owned by this gateway — never adopted (I1)
     state.adopted = False

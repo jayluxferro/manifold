@@ -8,6 +8,7 @@ from collections.abc import Awaitable, Callable
 
 import httpx
 
+from manifold import shim
 from manifold.chain import rewire_around
 from manifold.models import GatewayConfig, PipelineState, ServiceState, ServiceStatus
 
@@ -28,6 +29,14 @@ async def check_service_health(
 ) -> bool:
     """Ping a single service's health endpoint. Returns True if healthy."""
     svc = state.config
+    if shim.get_shim(svc.port) is not None:
+        # The port is a crash shim, not the real service: any 2xx here would
+        # be the NEXT service answering through the shim, which would flip a
+        # corpse to HEALTHY and rewire the chain back through a dead layer.
+        # Stay unhealthy until the shim is gone (the spawn that replaces it
+        # always stops the shim first — process.start_service).
+        log.debug("%s health check skipped — port is shimmed", svc.name)
+        return False
     url = f"http://127.0.0.1:{svc.port}{svc.health}"
     try:
         resp = await client.get(url, timeout=HEALTH_TIMEOUT)
@@ -144,8 +153,14 @@ async def health_loop(
     interval: float = DEFAULT_INTERVAL,
     stop_event: asyncio.Event | None = None,
     on_adopted_unhealthy: Callable[[ServiceState], Awaitable[None]] | None = None,
+    on_tick: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
-    """Background loop that checks service health and rewires the chain."""
+    """Background loop that checks service health and rewires the chain.
+
+    ``on_tick`` fires after every round (outside the per-round exception
+    guard) for gateway bookkeeping that must run periodically but is not a
+    health decision — the crash-shim reconcile uses it.
+    """
     async with httpx.AsyncClient() as client:
         while True:
             if stop_event and stop_event.is_set():
@@ -159,6 +174,11 @@ async def health_loop(
                 )
             except Exception:
                 log.exception("Health check loop error")
+            if on_tick is not None:
+                try:
+                    await on_tick()
+                except Exception:
+                    log.exception("Health tick callback error")
             try:
                 if stop_event:
                     await asyncio.wait_for(stop_event.wait(), timeout=interval)
