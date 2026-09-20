@@ -145,6 +145,14 @@ async def _proxy(request: Request) -> Response:
         # pick its own bucket and escape the port budget.
         headers["x-hivemind-agent-id"] = f"gateway-{_gateway_config.port}"
 
+    # Manifold's own observability headers are stripped inbound for the
+    # same trust-boundary reason: on a healthy chain the gateway stamps
+    # nothing, so a value arriving from the client would relay a
+    # compromised upstream's forged "x-manifold-bypassed: llm-redactor"
+    # verbatim (found by hostile verification).
+    for hop_controlled in ("x-manifold-bypassed", "x-manifold-shim"):
+        headers.pop(hop_controlled, None)
+
     # Auth normalization.  Anthropic accepts two different auth methods,
     # and they are NOT interchangeable:
     #
@@ -189,22 +197,6 @@ async def _proxy(request: Request) -> Response:
             content=body,
         )
         upstream_resp = await _http_client.send(upstream_req, stream=True)
-    except (httpx.ConnectError, httpx.TransportError) as exc:
-        # str(exc) is EMPTY for several transport exceptions (ReadError
-        # wrapping anyio.EndOfStream, ConnectTimeout) — always prefix the
-        # type and name the target or the log line is a bare colon.
-        detail = f"{type(exc).__name__}: {exc}".rstrip(": ")
-        log.error("Upstream connect error to %s: %s", url, detail)
-        return JSONResponse(
-            {
-                "error": {
-                    "type": "proxy_error",
-                    "message": f"Upstream unreachable: {target}",
-                }
-            },
-            status_code=502,
-            headers=extra_headers,
-        )
     except httpx.TimeoutException:
         log.error(
             "Upstream timeout: %s %s → %s (client may have hit a rate/account limit "
@@ -225,6 +217,22 @@ async def _proxy(request: Request) -> Response:
                 }
             },
             status_code=504,
+            headers=extra_headers,
+        )
+    except (httpx.ConnectError, httpx.TransportError) as exc:
+        # str(exc) is EMPTY for several transport exceptions (ReadError
+        # wrapping anyio.EndOfStream, ConnectTimeout) — always prefix the
+        # type and name the target or the log line is a bare colon.
+        detail = f"{type(exc).__name__}: {exc}".rstrip(": ")
+        log.error("Upstream connect error to %s: %s", url, detail)
+        return JSONResponse(
+            {
+                "error": {
+                    "type": "proxy_error",
+                    "message": f"Upstream unreachable: {target}",
+                }
+            },
+            status_code=502,
             headers=extra_headers,
         )
 

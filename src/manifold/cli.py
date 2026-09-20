@@ -474,8 +474,16 @@ async def _run_pipeline(
 
     # Register crash callback: rewire chain, then schedule auto-restart
     _restart_delays: dict[str, float] = {}
+    # Set by the signal handler below — an exit while True is OUR teardown
+    # SIGTERMing the children, not a crash: log it quietly and never
+    # rewire/restart (the user's 08:01 log showed every service "crashed —
+    # rewiring to bypass / will auto-restart" during a plain shutdown).
+    _shutting_down = False
 
     def _handle_crash(state: ServiceState) -> None:
+        if _shutting_down:
+            log.info("Service '%s' exited during shutdown", state.config.name)
+            return
         if state.adopted:
             # I1: kill/restart of an adopted service belongs to its owner
             # gateway.  But our chain must still route around the corpse, so
@@ -508,8 +516,10 @@ async def _run_pipeline(
             # service.  Started BEFORE the sleep so the shim start and the
             # restart are ordered within this one task — no bind race between
             # them; process.start_service stops the shim before respawning.
-            # If the crash is permanent the shim stays up and keeps the chain
-            # connected — minus the dead layer's function.
+            # If restarts keep failing the shim bridges until the TTL
+            # backstop (30 min) degrades loudly — an ADOPTED corpse's shim
+            # is released within one health tick by the entry-gone /
+            # dead-pid rules; nothing re-shims it (owner's job).
             await _maybe_start_shim(pipeline, state)
             await asyncio.sleep(delay)
             if state.status == ServiceStatus.STOPPED:
@@ -696,7 +706,6 @@ async def _run_pipeline(
 
     # Install our own signal handlers so cleanup always runs.
     loop = asyncio.get_running_loop()
-    _shutting_down = False
 
     def _handle_shutdown():
         nonlocal _shutting_down
