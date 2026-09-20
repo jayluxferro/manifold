@@ -1,10 +1,13 @@
 """Tests for manifold.chain module."""
 
+import logging
 import textwrap
 from pathlib import Path
 
+import pytest
 import yaml
 
+from manifold import chain as chain_module
 from manifold.chain import (
     _deep_get,
     _deep_set,
@@ -127,6 +130,59 @@ class TestResolveCommand:
         assert cmd == "echo test --port 8080 --upstream http://upstream:9090"
 
 
+class TestResolveCommandDefensive:
+    """M5: .format() turned every shell brace into a template and died with a
+    raw KeyError at `up` time.  Only identifier-shaped unknown placeholders
+    are errors; literal shell braces pass through."""
+
+    def test_unknown_identifier_placeholder_raises_clear_error(self):
+        svc = _svc("test", 8080)
+        svc.command = "run --port {port} --flag {oops}"
+        with pytest.raises(ValueError, match=r"\{oops\}"):
+            resolve_command(svc, "http://upstream:9090")
+
+    def test_error_names_command_and_the_valid_placeholders(self):
+        svc = _svc("test", 8080)
+        svc.command = "deploy {oops} --port {port}"
+        with pytest.raises(
+            ValueError, match=r"deploy \{oops\}.*\{port\} and \{upstream\}"
+        ):
+            resolve_command(svc, "http://upstream:9090")
+
+    def test_awk_braces_pass_through(self):
+        """awk '{print $1}' is not identifier-shaped inside the braces —
+        literal shell syntax, not a placeholder."""
+        svc = _svc("test", 8080)
+        svc.command = "awk '{print $1}' --port {port} --upstream {upstream}"
+        cmd = resolve_command(svc, "http://upstream:9090")
+        assert cmd == "awk '{print $1}' --port 8080 --upstream http://upstream:9090"
+
+    def test_empty_braces_pass_through(self):
+        """Literal `{}` (find/xargs style, shell brace expansion) must not
+        IndexError the way str.format's positional slot did."""
+        svc = _svc("test", 8080)
+        svc.command = "mytool {} --port {port}"
+        assert resolve_command(svc, "http://u") == "mytool {} --port 8080"
+
+    def test_numeric_braces_pass_through(self):
+        svc = _svc("test", 8080)
+        svc.command = "mytool {0} --port {port}"
+        assert resolve_command(svc, "http://u") == "mytool {0} --port 8080"
+
+    def test_double_braces_still_escape(self):
+        svc = _svc("test", 8080)
+        svc.command = "cmd {{literal}} --port {port}"
+        assert resolve_command(svc, "http://u") == "cmd {literal} --port 8080"
+
+
+@pytest.fixture(autouse=True)
+def _reset_bypass_warnings():
+    """Keep the module-level warned-set from leaking between tests."""
+    chain_module._entry_bypass_warned.clear()
+    yield
+    chain_module._entry_bypass_warned.clear()
+
+
 class TestPatchServiceConfig:
     def test_patches_yaml(self, tmp_path: Path):
         config_content = textwrap.dedent("""\
@@ -199,3 +255,70 @@ class TestGetEntryUrl:
         )
         gw = GatewayConfig()
         assert get_entry_url(pipeline, gw) is None
+
+
+class TestEntryBypassPrivacyWarning:
+    """c3: an entry-hop bypass of the redactor is a silent privacy event no
+    more — one warning per bypass episode."""
+
+    def _pipeline(self):
+        return PipelineState(
+            services=[
+                ServiceState(
+                    config=_svc("llm-redactor", 7001),
+                    status=ServiceStatus.UNHEALTHY,
+                ),
+                ServiceState(
+                    config=_svc("hivemind", 7002),
+                    status=ServiceStatus.HEALTHY,
+                ),
+            ]
+        )
+
+    def test_bypass_warns_privacy_degradation(self, caplog):
+        pipeline = self._pipeline()
+        with caplog.at_level(logging.WARNING, logger="manifold.chain"):
+            url = get_entry_url(pipeline, GatewayConfig())
+        assert url == "http://127.0.0.1:7002"
+        privacy = [r for r in caplog.records if "privacy" in r.getMessage().lower()]
+        assert len(privacy) == 1
+        assert "llm-redactor" in privacy[0].getMessage()
+
+    def test_warns_once_per_episode(self, caplog):
+        pipeline = self._pipeline()
+        with caplog.at_level(logging.WARNING, logger="manifold.chain"):
+            get_entry_url(pipeline, GatewayConfig())
+            get_entry_url(pipeline, GatewayConfig())  # per-request calls must not spam
+        assert (
+            len([r for r in caplog.records if "privacy" in r.getMessage().lower()]) == 1
+        )
+
+    def test_rewarns_after_recovery(self, caplog):
+        pipeline = self._pipeline()
+        gw = GatewayConfig()
+        with caplog.at_level(logging.WARNING, logger="manifold.chain"):
+            get_entry_url(pipeline, gw)
+            pipeline.services[0].status = ServiceStatus.HEALTHY
+            get_entry_url(pipeline, gw)  # entry returns to the redactor
+            pipeline.services[0].status = ServiceStatus.UNHEALTHY
+            get_entry_url(pipeline, gw)  # new bypass episode
+        assert (
+            len([r for r in caplog.records if "privacy" in r.getMessage().lower()]) == 2
+        )
+
+    def test_no_warning_for_non_redactor(self, caplog):
+        pipeline = PipelineState(
+            services=[
+                ServiceState(
+                    config=_svc("veritas", 7001),
+                    status=ServiceStatus.UNHEALTHY,
+                ),
+                ServiceState(
+                    config=_svc("hivemind", 7002),
+                    status=ServiceStatus.HEALTHY,
+                ),
+            ]
+        )
+        with caplog.at_level(logging.WARNING, logger="manifold.chain"):
+            assert get_entry_url(pipeline, GatewayConfig()) == "http://127.0.0.1:7002"
+        assert not [r for r in caplog.records if "privacy" in r.getMessage().lower()]

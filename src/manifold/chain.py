@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 import yaml
@@ -138,12 +139,62 @@ def patch_service_config(service: ServiceConfig, upstream_url: str) -> None:
     )
 
 
+class _TemplateVars(dict):
+    """``str.format_map`` lookup that fails loudly only for placeholder-like keys.
+
+    A command string is shell, so braces are usually literals (awk programs,
+    find's ``{}``, brace expansion).  The old bare ``.format()`` turned every
+    brace into a template and died with a raw KeyError/IndexError at ``up``
+    time — after validation had already passed.  The rules here, in order:
+
+    - ``{port}`` / ``{upstream}`` -> substituted (the only valid placeholders);
+    - ``{word}`` where *word* is an identifier -> :exc:`ValueError` naming the
+      placeholder and the command.  That shape is almost certainly a typo, not
+      shell syntax, so it must be a loud config error, not a traceback;
+    - anything else (``{}``, ``{print $1}``, ``{0}``) -> passed through
+      literally.
+
+    ``{}`` and ``{digits}`` are positional slots to str.format and IndexError
+    before ``__missing__`` is ever consulted, so ``resolve_command``
+    pre-escapes them into ``{{...}}`` (str.format's own literal-brace escape).
+    """
+
+    def __init__(self, command: str) -> None:
+        super().__init__()
+        self._command = command
+
+    def __missing__(self, key: str) -> str:
+        if key.isidentifier():
+            raise ValueError(
+                f"Command template {self._command!r} contains unknown placeholder "
+                f"{{{key}}}. Only {{port}} and {{upstream}} are substituted; to "
+                "pass a literal single-brace group through to the shell, make it "
+                "non-identifier-shaped (e.g. awk '{print $1}') or double the "
+                "braces ({{...}})."
+            )
+        return "{" + key + "}"  # awk programs, brace expansion — shell syntax
+
+
+# Positional slots ({} and {0}) — pre-escaped so they survive format_map as
+# literals.  Lookarounds skip brace groups already escaped as {{...}}.
+_POSITIONAL_SLOT_RE = re.compile(r"(?<!\{)\{(\d*)\}(?!\})")
+
+
 def resolve_command(service: ServiceConfig, upstream_url: str) -> str:
-    """Resolve template variables in a service's command string."""
-    return service.command.format(
-        port=service.port,
-        upstream=upstream_url,
+    """Resolve template variables in a service's command string.
+
+    Only ``{port}`` and ``{upstream}`` are placeholders; see :class:`_TemplateVars`
+    for how literal shell braces are treated.  Raises :exc:`ValueError` for an
+    identifier-shaped unknown placeholder so config errors surface at
+    validation time, not mid-spawn.
+    """
+    command = _POSITIONAL_SLOT_RE.sub(
+        lambda m: "{{" + m.group(1) + "}}", service.command
     )
+    variables = _TemplateVars(command)
+    variables["port"] = str(service.port)
+    variables["upstream"] = upstream_url
+    return command.format_map(variables)
 
 
 def wire_pipeline(
@@ -197,6 +248,19 @@ def rewire_around(
     return upstreams
 
 
+# Service-name fragments whose entry-hop bypass degrades privacy.  The
+# redactor is the chain's PII scrubber: when the gateway's entry hop skips it,
+# raw (un-redacted) payloads reach every downstream service and
+# restore-on-response never runs.
+_PRIVACY_CRITICAL_FRAGMENTS = ("redactor",)
+
+# Entry services already warned about in the current bypass episode, cleared
+# when the service is servable again so a recurring bypass re-warns.
+# get_entry_url runs once per request — without this a dead redactor would
+# spam one warning per request.
+_entry_bypass_warned: set[str] = set()
+
+
 def get_entry_url(pipeline: PipelineState, gateway: GatewayConfig) -> str | None:
     """Get the URL the gateway should forward requests to.
 
@@ -204,11 +268,29 @@ def get_entry_url(pipeline: PipelineState, gateway: GatewayConfig) -> str | None
     pipeline is down.  The gateway must never bypass the pipeline and send
     directly to the cloud — if no service is available, requests should
     fail with 503.
+
+    Skipping an enabled-but-down service is a real traffic bypass (the only
+    one manifold performs — mid-chain deaths rely on auto-restart), so when
+    the skipped service is a redactor we warn loudly about the privacy
+    degradation: raw PII flows until it is restored.
     """
     for state in pipeline.services:
-        if state.config.enabled and state.status in (
-            ServiceStatus.HEALTHY,
-            ServiceStatus.STARTING,
-        ):
+        if not state.config.enabled:
+            continue
+        if state.status in (ServiceStatus.HEALTHY, ServiceStatus.STARTING):
+            _entry_bypass_warned.discard(state.config.name)
             return f"http://127.0.0.1:{state.config.port}"
+        # Enabled but not servable -> bypassed at the entry hop.
+        name = state.config.name
+        if (
+            any(frag in name.lower() for frag in _PRIVACY_CRITICAL_FRAGMENTS)
+            and name not in _entry_bypass_warned
+        ):
+            _entry_bypass_warned.add(name)
+            log.warning(
+                "Entry-hop bypass of redactor service '%s' — privacy degradation: "
+                "raw PII flows to the rest of the chain until it is restored; "
+                "restore-on-response is skipped",
+                name,
+            )
     return None

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import yaml
 
+from manifold.chain import resolve_command
 from manifold.models import (
     GatewayConfig,
     ManifoldConfig,
@@ -143,6 +144,18 @@ def load_config(path: str | Path | None = None) -> ManifoldConfig:
         )
 
     services = [_parse_service(entry) for entry in pipeline_raw]
+
+    # Exercise every command template now (M5b): substitution is purely
+    # textual, so dummy values are enough to catch a bad placeholder.  The
+    # old code passed validation and KeyError'd midway through `up`, leaving
+    # a half-started chain behind.  Disabled services are checked too — they
+    # can be re-enabled via hot-reload on a running gateway where there is
+    # no validate pass.
+    for svc in services:
+        try:
+            resolve_command(svc, f"http://127.0.0.1:{svc.port + 1}")
+        except ValueError as exc:
+            raise ConfigError(f"Service '{svc.name}': {exc}") from exc
 
     # Validate no duplicate names or ports
     names = [s.name for s in services]

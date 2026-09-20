@@ -275,3 +275,73 @@ def test_default_gateway_values(tmp_path: Path):
     assert cfg.gateway.startup_health_timeout == 120.0
     assert cfg.gateway.startup_health_poll_interval == 0.25
     assert cfg.gateway.startup_health_strict is False
+
+
+def test_unknown_command_placeholder_fails_validation(tmp_path: Path):
+    """M5b: a bad placeholder must fail `validate`/load_config loudly instead
+    of KeyError'ing midway through `up`."""
+    content = textwrap.dedent("""\
+        pipeline:
+          - name: a
+            directory: /tmp
+            command: "run --port {port} --flag {oops}"
+            port: 7001
+            health: /h
+            upstream_via: cli_arg
+    """)
+    p = tmp_path / "manifold.yaml"
+    p.write_text(content)
+    with pytest.raises(ConfigError, match=r"\{oops\}"):
+        load_config(p)
+
+
+def test_validation_names_the_service(tmp_path: Path):
+    content = textwrap.dedent("""\
+        pipeline:
+          - name: my-typo-service
+            directory: /tmp
+            command: "run --port {port} --flag {oops}"
+            port: 7001
+            health: /h
+            upstream_via: cli_arg
+    """)
+    p = tmp_path / "manifold.yaml"
+    p.write_text(content)
+    with pytest.raises(ConfigError, match="my-typo-service"):
+        load_config(p)
+
+
+def test_shell_literal_braces_pass_validation(tmp_path: Path):
+    """awk-style braces are shell syntax, not placeholders — valid config."""
+    content = textwrap.dedent("""\
+        pipeline:
+          - name: a
+            directory: /tmp
+            command: "awk '{print $1}' --port {port} --upstream {upstream}"
+            port: 7001
+            health: /h
+            upstream_via: cli_arg
+    """)
+    p = tmp_path / "manifold.yaml"
+    p.write_text(content)
+    cfg = load_config(p)
+    assert cfg.pipeline[0].port == 7001
+
+
+def test_validation_covers_disabled_services(tmp_path: Path):
+    """A disabled service can be hot-reload-enabled later — validate its
+    template up front too."""
+    content = textwrap.dedent("""\
+        pipeline:
+          - name: a
+            directory: /tmp
+            command: "echo {broken}"
+            port: 7001
+            health: /h
+            upstream_via: cli_arg
+            enabled: false
+    """)
+    p = tmp_path / "manifold.yaml"
+    p.write_text(content)
+    with pytest.raises(ConfigError, match=r"\{broken\}"):
+        load_config(p)
