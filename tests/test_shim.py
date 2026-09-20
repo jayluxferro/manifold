@@ -174,12 +174,15 @@ async def test_target_unreachable_closes_client_side():
         reader, writer = await asyncio.open_connection("127.0.0.1", handle.listen_port)
         writer.write(b"going nowhere")
         await writer.drain()
-        # The shim's connect fails → our side is closed.  Closing with our
-        # still-unread bytes in flight sends RST, so accept either error form
-        # a dead corpse port produces today: reset or clean EOF.
-        with pytest.raises((ConnectionResetError, ConnectionError)):
+        # The shim's connect fails → our side is closed.  The exact form
+        # depends on the platform's TCP stack: a close with still-unread
+        # bytes in flight sends RST (macOS), a clean FIN gives EOF (CI's
+        # Linux).  Both are the corpse-port contract: connection dead.
+        try:
             data = await asyncio.wait_for(reader.read(4096), timeout=5.0)
-            assert data == b""
+            assert data == b""  # clean EOF
+        except (ConnectionResetError, ConnectionError):
+            pass  # RST
         writer.close()
     finally:
         await stop_shim(handle)
