@@ -107,6 +107,8 @@ pipeline:
 
 After subprocesses start, Manifold **polls each enabled service’s health endpoint** (parallel HTTP GETs every `startup_health_poll_interval` seconds, up to `startup_health_timeout`). When every check returns 2xx, the gateway binds. If the deadline passes: by default a **warning** is logged and startup continues; with **`startup_health_strict: true`**, `manifold up` **exits with status 1** instead.
 
+**Mid-chain bypass semantics, honestly:** health checks drive two different mechanisms. The gateway's **entry hop** — which service agent requests enter first — truly bypasses: if the first service dies, traffic enters at the next healthy one (and if that dead service is the PII redactor, **raw, un-redacted payloads flow to the rest of the chain** until it is restored; Manifold logs a privacy warning when this happens). For a service that dies **mid-chain**, there is no traffic bypass today: the chain is rewired in memory and the crashed service is auto-restarted with an upstream that skips other dead services, but the services *before* it keep sending to its dead port — those requests fail or time out until the auto-restart brings it back. Mid-chain deaths rely on auto-restart; true traffic bypass happens only at the entry hop.
+
 On **Windows**, stopping a service uses `terminate`/`kill` on the top-level shell process; on **Linux/macOS** it uses **process groups** (`killpg`) so child processes created by the shell are included. Child processes that **fully detach** from the shell may keep running; for the same teardown guarantees as Unix, run Manifold under **WSL** or use a full process-tree stop (for example `taskkill /PID … /T` on the shell PID) outside Manifold.
 
 ### Pipeline Order
@@ -294,7 +296,7 @@ All other requests are forwarded transparently to the first service in the pipel
 
 - **Manifold never touches request/response bodies** — it's a topology manager and entry proxy, not a middleware
 - **Streaming first** — SSE pass-through is mandatory for LLM response streaming
-- **Fail-open** — if a service goes down, manifold rewires the chain to bypass it
+- **Fail-open** — if a service goes down, manifold rewires the chain: a real traffic bypass at the entry hop, auto-restart for mid-chain deaths (see the health-check section above)
 - **Hot-reloadable** — edit manifold.yaml while running, changes apply automatically
 - **Simple process management** — subprocesses with PID tracking, no containers
 - **Convention over configuration** — services follow the OpenAI/Anthropic proxy pattern
