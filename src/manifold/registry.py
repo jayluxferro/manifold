@@ -250,8 +250,87 @@ def release_spawn_lock(identity: str) -> None:
     lock_path(identity).unlink(missing_ok=True)
 
 
+# An unparseable lock file younger than this may belong to a live writer that
+# has created the file (O_EXCL) but not yet written its pid — unlinking it
+# would let a second gateway take the same lock and break I1 exclusivity.
+# One full spawn-lock wait window (service_ops.SPAWN_LOCK_RETRIES *
+# SPAWN_LOCK_WAIT = 50 * 0.2s) bounds any in-flight acquire, so past that a
+# writerless lock cannot be mid-acquire.  Duplicated here (instead of
+# imported from service_ops) because service_ops imports registry.
+LOCK_SWEEP_MIN_AGE_SECONDS = 10.0
+
+
+def _sweep_spawn_locks() -> None:
+    """Remove spawn locks whose writer is gone (M2).
+
+    ``acquire_spawn_lock`` is bare O_EXCL: a gateway SIGKILLed between
+    acquiring and releasing leaves ``<identity>.lock`` behind forever, and
+    every future ``up`` retries the full 10s window on that identity and then
+    silently gives up — a bricked service.  The lock file records the writer
+    pid, so:
+
+    - readable pid, dead writer -> stale, unlink;
+    - readable pid, live writer -> somebody may legitimately hold it right
+      now, leave it alone;
+    - empty/corrupt file -> unlink only once it is older than the in-flight
+      window above (a live writer's file is milliseconds old).
+    """
+    locks = locks_dir()
+    if not locks.is_dir():
+        return
+    now = time.time()
+    for lock in locks.glob("*.lock"):
+        try:
+            try:
+                writer = int(lock.read_text().strip())
+            except (ValueError, OSError, UnicodeDecodeError):
+                writer = None
+            if writer is not None and pid_alive(writer):
+                continue
+            if writer is None:
+                try:
+                    age = now - lock.stat().st_mtime
+                except OSError:
+                    continue  # vanished mid-sweep — someone else removed it
+                if age < LOCK_SWEEP_MIN_AGE_SECONDS:
+                    continue  # could be an in-flight acquire — give it time
+            _log.info("Sweeping stale spawn lock %s", lock.name)
+            lock.unlink(missing_ok=True)
+        except OSError:
+            continue
+
+
+def _sweep_stale_pid_files() -> None:
+    """Unlink gateway pid/port files whose pid is dead (M6).
+
+    ``up`` writes ``manifold-<port>.pid`` (bare pid) plus
+    ``manifold-<port>.port`` (host:port) per instance; a SIGKILLed gateway
+    leaves both behind and ``down``/``status`` keep discovering ghosts.
+    Corrupt (non-numeric) pid files are removed too — they cannot belong to a
+    live writer.  A live pid is left untouched: that gateway is running.
+    """
+    for pid_file in sorted(paths.PID_DIR.glob("manifold-*.pid")):
+        try:
+            port = int(pid_file.stem.split("-", 1)[1])
+        except (IndexError, ValueError):
+            port = None
+        try:
+            pid = int(pid_file.read_text().strip())
+        except (ValueError, OSError, UnicodeDecodeError):
+            pid = None
+        if pid is not None and pid_alive(pid):
+            continue
+        _log.info("Sweeping stale pid file %s (pid=%s)", pid_file.name, pid)
+        try:
+            pid_file.unlink(missing_ok=True)
+            if port is not None:
+                paths.port_file_for(port).unlink(missing_ok=True)
+        except OSError:
+            continue
+
+
 def sweep_stale() -> None:
-    """Remove dead entries/leases and reap orphaned services (I2/I3/I7)."""
+    """Remove dead entries/leases/locks/pid files and reap orphans (I2/I3/I7)."""
     for entry in list_service_entries():
         identity = entry["identity"]
         if not pid_alive(entry.get("pid")):
@@ -277,6 +356,8 @@ def sweep_stale() -> None:
         if not pid_alive(lease.get("gateway_pid")):
             _log.info("Sweeping dead lease for gateway %s", lease["gateway_port"])
             remove_lease(lease["gateway_port"])
+    _sweep_spawn_locks()
+    _sweep_stale_pid_files()
 
 
 def compute_service_identity(svc: ServiceConfig, upstream_url: str) -> str:

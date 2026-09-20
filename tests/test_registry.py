@@ -2,6 +2,7 @@
 
 import os
 import signal
+import time
 from unittest.mock import patch
 
 import pytest
@@ -339,3 +340,90 @@ def test_sweep_removes_dead_lease(tmp_run, monkeypatch):
     registry.sweep_stale()
     assert registry.read_lease(9000) is None
     assert registry.read_lease(9001) is not None
+
+
+# --- stale spawn locks (M2) -------------------------------------------------
+
+
+def test_sweep_removes_dead_writer_lock(tmp_run, monkeypatch):
+    """A gateway SIGKILLed mid-spawn leaves its lock behind; the sweep must
+    free the identity instead of bricking every future `up`."""
+    lock = registry.lock_path("bricked")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text("999999999")  # dead writer pid
+    monkeypatch.setattr(registry, "pid_alive", lambda pid: False)
+    registry.sweep_stale()
+    assert not lock.exists()
+
+
+def test_sweep_leaves_live_writer_lock(tmp_run, monkeypatch):
+    """A live writer may hold the lock RIGHT NOW — never touch it."""
+    lock = registry.lock_path("held")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text(str(os.getpid()))  # this test process is alive
+    monkeypatch.setattr(registry, "pid_alive", lambda pid: pid == os.getpid())
+    registry.sweep_stale()
+    assert lock.exists()
+
+
+def test_sweep_removes_corrupt_lock_after_grace(tmp_run, monkeypatch):
+    """Empty/corrupt lock (writer died before writing its pid) is swept once
+    it is older than the in-flight-acquire window."""
+    lock = registry.lock_path("corrupt")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text("")
+    old = time.time() - registry.LOCK_SWEEP_MIN_AGE_SECONDS * 2
+    os.utime(lock, (old, old))
+    monkeypatch.setattr(registry, "pid_alive", lambda pid: False)
+    registry.sweep_stale()
+    assert not lock.exists()
+
+
+def test_sweep_keeps_fresh_corrupt_lock(tmp_run, monkeypatch):
+    """A FRESH empty lock may be mid-write by a live gateway (O_EXCL create
+    and pid write are two steps) — unlinking it would break I1 exclusivity."""
+    lock = registry.lock_path("fresh")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text("")
+    monkeypatch.setattr(registry, "pid_alive", lambda pid: False)
+    registry.sweep_stale()
+    assert lock.exists()
+
+
+def test_acquire_works_after_lock_sweep(tmp_run, monkeypatch):
+    lock = registry.lock_path("svc")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text("999999999")  # dead writer
+    monkeypatch.setattr(registry, "pid_alive", lambda pid: False)
+    registry.sweep_stale()
+    assert registry.acquire_spawn_lock("svc") is True
+    assert lock.read_text().strip() == str(os.getpid())
+    registry.release_spawn_lock("svc")
+
+
+# --- stale gateway pid files (M6) --------------------------------------------
+
+
+def test_sweep_removes_dead_pid_file(tmp_run, monkeypatch):
+    (tmp_run / "manifold-9000.pid").write_text("999999999")
+    (tmp_run / "manifold-9000.port").write_text("127.0.0.1:9000")
+    monkeypatch.setattr(registry, "pid_alive", lambda pid: False)
+    registry.sweep_stale()
+    assert not (tmp_run / "manifold-9000.pid").exists()
+    assert not (tmp_run / "manifold-9000.port").exists()
+
+
+def test_sweep_keeps_live_pid_file(tmp_run, monkeypatch):
+    (tmp_run / "manifold-9000.pid").write_text(str(os.getpid()))
+    (tmp_run / "manifold-9000.port").write_text("127.0.0.1:9000")
+    monkeypatch.setattr(registry, "pid_alive", lambda pid: pid == os.getpid())
+    registry.sweep_stale()
+    assert (tmp_run / "manifold-9000.pid").exists()
+    assert (tmp_run / "manifold-9000.port").exists()
+
+
+def test_sweep_removes_corrupt_pid_file(tmp_run, monkeypatch):
+    (tmp_run / "manifold-9000.pid").write_text("garbage")
+    monkeypatch.setattr(registry, "pid_alive", lambda pid: True)
+    registry.sweep_stale()
+    assert not (tmp_run / "manifold-9000.pid").exists()
