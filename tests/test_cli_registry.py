@@ -1349,7 +1349,6 @@ def test_dying_corpse_port_window_polled_not_fatal():
     ~80ms past reclaim — the poll must carry the spawn through instead
     of aborting.  Own-shim holders skip the poll entirely (reclaimable
     synchronously)."""
-    import asyncio
     from unittest.mock import patch
 
     from manifold import service_ops
