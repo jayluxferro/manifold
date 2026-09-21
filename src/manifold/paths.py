@@ -23,7 +23,9 @@ def port_file_for(port: int) -> Path:
     return PID_DIR / f"manifold-{port}.port"
 
 
-def is_port_in_use(port: int, host: str = "127.0.0.1", *, any_address: bool = True) -> bool:
+def is_port_in_use(
+    port: int, host: str = "127.0.0.1", *, any_address: bool = True
+) -> bool:
     """Return True if *port* is already bound on *host* (or, by default,
     on ANY local address).
 
