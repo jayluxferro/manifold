@@ -524,6 +524,9 @@ async def _run_pipeline(
             await asyncio.sleep(delay)
             if state.status == ServiceStatus.STOPPED:
                 return  # user explicitly stopped it
+            if _shutting_down:
+                return  # teardown began during the backoff — never respawn
+                # into a dying pipeline (round-eight residual)
             # Reconstruct the chain the way the health loop's bypass sees it
             # (live services only), but keep the crashed service in its own
             # slot: its upstream must be the next LIVE service after it.  The
