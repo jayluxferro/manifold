@@ -240,6 +240,15 @@ async def _proxy(request: Request) -> Response:
     resp_headers.pop("transfer-encoding", None)
     resp_headers.pop("content-length", None)
     resp_headers.pop("content-encoding", None)
+    # The two manifold stamp names are stripped BEFORE the gateway's own
+    # values land: on a healthy chain extra_headers is empty and a
+    # compromised upstream's forged "x-manifold-bypassed: llm-redactor"
+    # would otherwise relay verbatim — and when the gateway DOES stamp one
+    # name, a forged OTHER name rode alongside (update only overwrites the
+    # stamped key).  Popping both makes the gateway the sole origin of
+    # both headers, stamped or not (found by hostile verification).
+    for hop_controlled in ("x-manifold-bypassed", "x-manifold-shim"):
+        resp_headers.pop(hop_controlled, None)
     # Bypass/shim stamps ride the proxied response too — set BEFORE the body
     # streams so both streaming and buffered paths carry them.
     resp_headers.update(extra_headers)

@@ -761,6 +761,12 @@ async def _run_pipeline(
         if server.started:
             await server.shutdown()
     finally:
+        # Non-signal teardowns (startup-health typer.Exit, lifespan failure)
+        # reach this finally with the flag still False — the watcher would
+        # fire the full "crashed — rewiring / will auto-restart" fiction for
+        # every child this teardown SIGTERMs (the exact noise the signal
+        # path fixed).  The flag is THE teardown marker; set it here too.
+        _shutting_down = True
         stop_event.set()
         if health_task is not None:
             health_task.cancel()
