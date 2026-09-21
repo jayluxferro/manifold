@@ -1342,3 +1342,34 @@ def test_down_pid_reuse_skip_logged(tmp_path: Path, caplog):
         "does not look like a manifold gateway" in r.getMessage()
         for r in caplog.records
     )
+
+
+def test_dying_corpse_port_window_polled_not_fatal():
+    """Round-eight measured race: a SIGKILL'd corpse's socket lingers
+    ~80ms past reclaim — the poll must carry the spawn through instead
+    of aborting.  Own-shim holders skip the poll entirely (reclaimable
+    synchronously)."""
+    import asyncio
+    from unittest.mock import patch
+
+    from manifold import service_ops
+
+    calls = {"n": 0}
+
+    def busy_then_free(port, host="127.0.0.1", any_address=True):
+        calls["n"] += 1
+        return calls["n"] <= 3  # dying: clears on the 4th poll
+
+    with (
+        patch("manifold.paths.is_port_in_use", side_effect=busy_then_free),
+        patch("manifold.shim.get_shim", return_value=None),
+    ):
+        assert service_ops._wait_port_free(7001, attempts=8, delay_s=0.0) is True
+    never_free = {"n": 0}
+
+    def always_busy(port, host="127.0.0.1", any_address=True):
+        never_free["n"] += 1
+        return True
+
+    with patch("manifold.paths.is_port_in_use", side_effect=always_busy):
+        assert service_ops._wait_port_free(7001, attempts=3, delay_s=0.0) is False

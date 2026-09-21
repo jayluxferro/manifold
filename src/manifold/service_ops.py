@@ -196,16 +196,23 @@ async def _spawn_owned(
                     # adopted) holds the port legitimately: the spawn below
                     # stops it before the child binds.  A genuinely foreign
                     # occupant still fails the check.
-                    # A SIGKILL'd corpse can hold its listen socket ~80ms
-                    # past the reclaim grace (measured, round eight) — the
-                    # kernel reaps asynchronously.  Poll briefly for the
-                    # socket to close before declaring a hard collision, so
-                    # a wedged-then-killed service's restart doesn't flakily
-                    # abort `manifold up`.
-                    if not _wait_port_free(svc.port, attempts=8, delay_s=0.1):
-                        # I4: genuinely occupied — the kill was skipped
-                        # (pid/pgid reuse) or the process survived SIGKILL —
-                        # never spawn on a port we could not free.
+                    # OUR shim holding the port is reclaimable as-is —
+                    # start_service stops it before the child binds; the
+                    # poll below must not apply (the test suite pinned this
+                    # and was right to).
+                    if shim.get_shim(svc.port) is not None or _wait_port_free(
+                        svc.port, attempts=8, delay_s=0.1
+                    ):
+                        pass  # reclaimable or freed — proceed to spawn
+                    else:
+                        # I4: genuinely occupied — a SIGKILL'd corpse can
+                        # hold its socket ~80ms past the reclaim grace
+                        # (measured, round eight; the kernel reaps
+                        # asynchronously), and we polled that window out.
+                        # Anything still listening after the poll was a
+                        # skipped kill (pid/pgid reuse) or a SIGKILL
+                        # survivor — never spawn on a port we could not
+                        # free.
                         raise typer.Exit(
                             f"Port {svc.port} still occupied after reclaiming "
                             f"'{svc.name}' — not spawning"
