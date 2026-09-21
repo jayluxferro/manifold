@@ -23,11 +23,39 @@ def port_file_for(port: int) -> Path:
     return PID_DIR / f"manifold-{port}.port"
 
 
-def is_port_in_use(port: int, host: str = "127.0.0.1") -> bool:
-    """Return True if *port* is already bound on *host*."""
+def is_port_in_use(port: int, host: str = "127.0.0.1", *, any_address: bool = True) -> bool:
+    """Return True if *port* is already bound on *host* (or, by default,
+    on ANY local address).
+
+    The any-address sweep exists because macOS lets a specific-address
+    listener (e.g. a crash shim bound to 127.0.0.1:P) coexist with a new
+    wildcard bind (0.0.0.0:P): the spawn preflight used to probe only the
+    requested host, saw "free", and the service came up "healthy" while
+    127.0.0.1 traffic silently kept flowing to the shim — four layers
+    bypassed and a latent forwarding loop (found by the Sep-20 forensics).
+    Preflight now connects against every address the interface table
+    exposes, so ANY listener on the port blocks the spawn (the gateway's
+    own shim-reclaim path still clears reclaimable shims first).
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(0.1)
-        return s.connect_ex((host, port)) == 0
+        if s.connect_ex((host, port)) == 0:
+            return True
+    if not any_address:
+        return False
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        return bool(out.stdout.strip())
+    except Exception:
+        # lsof missing/slow: degrade to the single-host probe we had.
+        return False
 
 
 def check_port_collisions(

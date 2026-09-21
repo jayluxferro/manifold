@@ -71,3 +71,25 @@ def test_check_port_collisions_service_collision():
         errors = check_port_collisions(9000, {"svc-a": 7001, "svc-b": 7002})
     assert len(errors) == 1
     assert "svc-a" in errors[0]
+
+
+def test_is_port_in_use_catches_specific_address_listener(tmp_path):
+    """Regression (Sep-20 forensics): a listener bound to 127.0.0.1:P coexists
+    with a wildcard bind on macOS — the old single-host probe against a
+    different host (or the wildcard race) saw 'free' and a service spawned
+    alongside a shim that kept stealing loopback traffic.  The any-address
+    sweep must see a listener on ANY interface."""
+    import socket
+
+    from manifold.paths import is_port_in_use
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        # Probe the wildcard host explicitly — the sweep must find the
+        # specific-address listener regardless.
+        assert is_port_in_use(port, "0.0.0.0") is True
+        assert is_port_in_use(port, "127.0.0.1") is True
+    # Released.
+    assert is_port_in_use(port, "127.0.0.1") is False
