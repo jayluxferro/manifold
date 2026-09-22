@@ -483,9 +483,9 @@ def test_fully_down_503_carries_degradation_stamps():
     before they're computed."""
     from unittest.mock import patch
 
-    from manifold.gateway import app
+    from starlette.testclient import TestClient
 
-    from fastapi.testclient import TestClient
+    from manifold import gateway as gateway_mod
 
     with (
         patch(
@@ -493,7 +493,7 @@ def test_fully_down_503_carries_degradation_stamps():
         ),
         patch("manifold.gateway._shimmed_service_names", return_value=["veritas"]),
     ):
-        r = TestClient(app).post("/v1/messages", content=b"{}")
+        r = TestClient(gateway_mod.app).post("/v1/messages", content=b"{}")
     assert r.status_code == 503
     assert r.headers.get("x-manifold-bypassed") == "llm-redactor"
     assert r.headers.get("x-manifold-shim") == "veritas"
