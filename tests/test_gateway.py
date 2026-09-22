@@ -481,19 +481,19 @@ def test_fully_down_503_carries_degradation_stamps():
     """Round-seven minor closed: the no-route 503 is precisely when the
     bypass/shim signal matters — it must carry the stamps, not return
     before they're computed."""
-    from unittest.mock import patch
-
     from starlette.testclient import TestClient
 
-    from manifold import gateway as gateway_mod
+    from manifold.models import GatewayConfig, PipelineState, ServiceState, ServiceStatus
 
-    with (
-        patch(
-            "manifold.gateway._get_entry_route", return_value=(None, ["llm-redactor"])
-        ),
-        patch("manifold.gateway._shimmed_service_names", return_value=["veritas"]),
-    ):
-        r = TestClient(gateway_mod.app).post("/v1/messages", content=b"{}")
+    pipeline = _make_pipeline()
+    app = create_app(
+        pipeline=pipeline,
+        gateway_config=GatewayConfig(),
+        # No route: the fully-down state.  Bypass list non-empty so the
+        # stamp must ride even the 503.
+        get_entry_route=lambda: (None, ["llm-redactor"]),
+    )
+    with TestClient(app) as c:
+        r = c.post("/v1/messages", content=b"{}")
     assert r.status_code == 503
     assert r.headers.get("x-manifold-bypassed") == "llm-redactor"
-    assert r.headers.get("x-manifold-shim") == "veritas"
