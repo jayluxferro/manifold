@@ -892,8 +892,11 @@ def gateways() -> None:
             lease = json.loads(lease_path.read_text())
         except (OSError, json.JSONDecodeError):
             continue
-        gw_port = int(lease.get("gateway_port", 0))
-        gw_pid = int(lease.get("gateway_pid", 0))
+        try:
+            gw_port = int(lease.get("gateway_port") or 0)
+            gw_pid = int(lease.get("gateway_pid") or 0)
+        except (TypeError, ValueError):
+            continue  # junk lease field — skip, never crash the listing
         if gw_port and gw_pid and registry.pid_alive(gw_pid):
             # The chain's hivemind port: match service entries to this
             # gateway via the lease's own identity list (the entry's
@@ -924,7 +927,7 @@ def gateways() -> None:
 
     typer.echo(f"{len(rows)} live gateway(s):")
     for gw_port, hive_port, config in rows:
-        typer.echo(f"  gateway :{gw_port}  ({config})")
+        typer.echo(f"  gateway :{gw_port}")  # config_path: leases never record it
         if hive_port:
             typer.echo(f"    telemetry: http://localhost:{hive_port}/_telemetry")
             typer.echo(f"    stats:     http://localhost:{gw_port}/_manifold/stats")
