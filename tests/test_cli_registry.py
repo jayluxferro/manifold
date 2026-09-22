@@ -1423,3 +1423,61 @@ def test_gateways_command_lists_live_instances(tmp_path, capsys):
         (registry.leases_dir() / "gateway-37000.json").write_text(json.dumps(dead))
         result2 = CliRunner().invoke(app, ["gateways"])
         assert "37000" not in result2.output
+
+
+def test_gateways_ignores_stale_higher_port_entry(tmp_path):
+    """Round-ten: a stale hivemind entry (dead pid, HIGHER port) from a
+    previous generation won the max() fold and shadowed the live one —
+    the command pointed at a corpse."""
+    import json
+
+    from manifold import registry
+    from manifold.cli import app
+    from typer.testing import CliRunner
+
+    with patch("manifold.paths.PID_DIR", tmp_path):
+        live = _entry("id-live", owner_port=15000)
+        live["name"] = "hivemind"
+        live["port"] = 15010
+        live["pid"] = os.getpid()
+        registry.write_service_entry(live)
+
+        stale = _entry("id-stale", owner_port=15000)
+        stale["name"] = "hivemind"
+        stale["port"] = 26010  # higher — would win max()
+        stale["pid"] = 999999999  # dead
+        registry.write_service_entry(stale)
+
+        lease = {
+            "schema_version": 1,
+            "gateway_port": 15000,
+            "gateway_pid": os.getpid(),
+            "identities": ["id-live", "id-stale"],
+        }
+        registry.leases_dir().mkdir(parents=True, exist_ok=True)
+        (registry.leases_dir() / "gateway-15000.json").write_text(json.dumps(lease))
+
+        result = CliRunner().invoke(app, ["gateways"])
+        assert result.exit_code == 0, result.output
+        assert "http://localhost:15010/_telemetry" in result.output
+        assert "26010" not in result.output
+
+
+def test_gateways_survives_junk_lease_fields(tmp_path):
+    import json
+
+    from manifold import registry
+    from manifold.cli import app
+    from typer.testing import CliRunner
+
+    with patch("manifold.paths.PID_DIR", tmp_path):
+        registry.leases_dir().mkdir(parents=True, exist_ok=True)
+        (registry.leases_dir() / "gateway-null.json").write_text(
+            json.dumps({"gateway_port": None, "gateway_pid": None})
+        )
+        (registry.leases_dir() / "gateway-junk.json").write_text(
+            json.dumps({"gateway_port": "not-a-number"})
+        )
+        result = CliRunner().invoke(app, ["gateways"])
+        assert result.exit_code == 0, result.output
+        assert "No live manifold gateways" in result.output
