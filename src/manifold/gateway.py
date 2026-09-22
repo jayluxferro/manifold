@@ -106,6 +106,21 @@ async def _proxy(request: Request) -> Response:
     else:
         target = _target_url()
         entry_bypassed = []
+    # Per-request bypass observability: a redactor-out window (or any other
+    # bypass) must be visible on the traffic itself, not only in logs.  Both
+    # headers ride every response this request produces — proxied, streamed,
+    # error, or the 503 below (the fully-down state is precisely when the
+    # degradation signal matters most) — and are absent on a healthy chain.
+    # Computed BEFORE the availability check: with no route, _shimmed_
+    # over-announces every live shim by design (silence would hide the
+    # degradation).
+    extra_headers: dict[str, str] = {}
+    if entry_bypassed:
+        extra_headers["x-manifold-bypassed"] = ",".join(entry_bypassed)
+    shimmed = _shimmed_service_names(target)
+    if shimmed:
+        extra_headers["x-manifold-shim"] = ",".join(shimmed)
+
     if target is None:
         return JSONResponse(
             {
@@ -115,18 +130,8 @@ async def _proxy(request: Request) -> Response:
                 }
             },
             status_code=503,
+            headers=extra_headers,
         )
-
-    # Per-request bypass observability: a redactor-out window (or any other
-    # bypass) must be visible on the traffic itself, not only in logs.  Both
-    # headers ride every response this request produces — proxied, streamed,
-    # or error — and are absent on a healthy chain.
-    extra_headers: dict[str, str] = {}
-    if entry_bypassed:
-        extra_headers["x-manifold-bypassed"] = ",".join(entry_bypassed)
-    shimmed = _shimmed_service_names(target)
-    if shimmed:
-        extra_headers["x-manifold-shim"] = ",".join(shimmed)
 
     url = f"{target}{request.url.path}"
     if request.url.query:

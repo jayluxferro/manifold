@@ -475,3 +475,25 @@ def test_error_response_carries_bypass_header():
         resp = c.post("/v1/messages", json={"model": "test"})
         assert resp.status_code == 502
         assert resp.headers["x-manifold-bypassed"] == "llm-redactor"
+
+
+def test_fully_down_503_carries_degradation_stamps():
+    """Round-seven minor closed: the no-route 503 is precisely when the
+    bypass/shim signal matters — it must carry the stamps, not return
+    before they're computed."""
+    from unittest.mock import patch
+
+    from manifold.gateway import app
+
+    from fastapi.testclient import TestClient
+
+    with (
+        patch(
+            "manifold.gateway._get_entry_route", return_value=(None, ["llm-redactor"])
+        ),
+        patch("manifold.gateway._shimmed_service_names", return_value=["veritas"]),
+    ):
+        r = TestClient(app).post("/v1/messages", content=b"{}")
+    assert r.status_code == 503
+    assert r.headers.get("x-manifold-bypassed") == "llm-redactor"
+    assert r.headers.get("x-manifold-shim") == "veritas"
