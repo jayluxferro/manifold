@@ -483,7 +483,9 @@ def test_fully_down_503_carries_degradation_stamps():
     before they're computed."""
     from starlette.testclient import TestClient
 
-    from manifold.models import GatewayConfig, PipelineState, ServiceState, ServiceStatus
+    from manifold.models import (
+        GatewayConfig,
+    )
 
     pipeline = _make_pipeline()
     app = create_app(

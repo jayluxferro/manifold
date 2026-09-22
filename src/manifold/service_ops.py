@@ -140,20 +140,23 @@ def _adopt_from_entry(state: ServiceState, entry: dict, upstream_url: str) -> No
     )
 
 
-def _wait_port_free(port: int, *, attempts: int, delay_s: float) -> bool:
+async def _wait_port_free(port: int, *, attempts: int, delay_s: float) -> bool:
     """Poll until no listener remains on *port* (any interface) or attempts run out.
 
     The dying-corpse window: a SIGKILLed service's socket lingers ~80ms
     past our reclaim grace while the kernel reaps.  True foreign occupants
-    never clear, so the poll only costs latency on the dying path.
+    never clear, so the poll only costs latency on the dying path.  Async
+    on purpose: _spawn_owned runs on the LIVE gateway's loop, and the
+    original blocking sleep froze all proxied traffic ~0.85s per wedged
+    promote (round-nine probe: a 10ms ticker got zero ticks during it).
+    The lsof probe inside is_port_in_use still blocks briefly (~50ms);
+    acceptable against 100ms awaits, and only on the final free verdict.
     """
-    import time as _time
-
     for _ in range(attempts):
-        if not paths.is_port_in_use(port):
+        if not await asyncio.to_thread(paths.is_port_in_use, port):
             return True
-        _time.sleep(delay_s)
-    return not paths.is_port_in_use(port)
+        await asyncio.sleep(delay_s)
+    return not await asyncio.to_thread(paths.is_port_in_use, port)
 
 
 async def _spawn_owned(
@@ -200,7 +203,7 @@ async def _spawn_owned(
                     # start_service stops it before the child binds; the
                     # poll below must not apply (the test suite pinned this
                     # and was right to).
-                    if shim.get_shim(svc.port) is not None or _wait_port_free(
+                    if shim.get_shim(svc.port) is not None or await _wait_port_free(
                         svc.port, attempts=8, delay_s=0.1
                     ):
                         pass  # reclaimable or freed — proceed to spawn

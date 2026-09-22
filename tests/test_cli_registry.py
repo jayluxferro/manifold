@@ -1363,7 +1363,11 @@ def test_dying_corpse_port_window_polled_not_fatal():
         patch("manifold.paths.is_port_in_use", side_effect=busy_then_free),
         patch("manifold.shim.get_shim", return_value=None),
     ):
-        assert service_ops._wait_port_free(7001, attempts=8, delay_s=0.0) is True
+        import asyncio as _a
+
+        assert (
+            _a.run(service_ops._wait_port_free(7001, attempts=8, delay_s=0.0)) is True
+        )
     never_free = {"n": 0}
 
     def always_busy(port, host="127.0.0.1", any_address=True):
@@ -1371,4 +1375,6 @@ def test_dying_corpse_port_window_polled_not_fatal():
         return True
 
     with patch("manifold.paths.is_port_in_use", side_effect=always_busy):
-        assert service_ops._wait_port_free(7001, attempts=3, delay_s=0.0) is False
+        assert (
+            _a.run(service_ops._wait_port_free(7001, attempts=3, delay_s=0.0)) is False
+        )
