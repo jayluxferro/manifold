@@ -1378,3 +1378,48 @@ def test_dying_corpse_port_window_polled_not_fatal():
         assert (
             _a.run(service_ops._wait_port_free(7001, attempts=3, delay_s=0.0)) is False
         )
+
+
+def test_gateways_command_lists_live_instances(tmp_path, capsys):
+    """`manifold gateways` answers 'which port is the mesh on' for ANY
+    number of isolated instances: one line per live lease, with each
+    chain's hivemind (telemetry) port matched via the lease identities."""
+    import json
+
+    from manifold import registry
+    from manifold.cli import app
+    from typer.testing import CliRunner
+
+    with patch("manifold.paths.PID_DIR", tmp_path):
+        # Two live gateways, each with its own hivemind entry.
+        for gw_port, hive_port in ((15000, 15010), (26000, 26010)):
+            hive_entry = _entry(f"id-hive-{gw_port}", owner_port=gw_port)
+            hive_entry["name"] = "hivemind"
+            hive_entry["port"] = hive_port
+            registry.write_service_entry(hive_entry)
+            lease = {
+                "schema_version": 1,
+                "gateway_port": gw_port,
+                "gateway_pid": os.getpid(),  # alive by definition
+                "identities": [f"id-hive-{gw_port}"],
+            }
+            registry.leases_dir().mkdir(parents=True, exist_ok=True)
+            (registry.leases_dir() / f"gateway-{gw_port}.json").write_text(
+                json.dumps(lease)
+            )
+
+        result = CliRunner().invoke(app, ["gateways"])
+        assert result.exit_code == 0, result.output
+        assert "2 live gateway(s)" in result.output
+        assert "http://localhost:15010/_telemetry" in result.output
+        assert "http://localhost:26010/_telemetry" in result.output
+        # A dead lease (pid gone) is not listed.
+        dead = {
+            "schema_version": 1,
+            "gateway_port": 37000,
+            "gateway_pid": 999999999,
+            "identities": [],
+        }
+        (registry.leases_dir() / "gateway-37000.json").write_text(json.dumps(dead))
+        result2 = CliRunner().invoke(app, ["gateways"])
+        assert "37000" not in result2.output

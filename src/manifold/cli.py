@@ -872,6 +872,59 @@ def up(
     asyncio.run(_run_pipeline(config, verbose, port_override=port, isolated=isolated))
 
 
+@app.command(name="gateways")
+def gateways() -> None:
+    """List every live manifold gateway with its ports and key endpoints.
+
+    One command answers 'which port is the mesh on': gateway ports from the
+    live leases, each chain's hivemind port (where the telemetry dashboard
+    lives — hitting /_telemetry on a GATEWAY port forwards the request
+    through the chain to the cloud, which answers a confusing 401), and
+    the running config file when the lease records it.
+    """
+    import json
+
+    from manifold import registry
+
+    rows: list[tuple[int, int, str]] = []  # (gw_port, hivemind_port, config)
+    for lease_path in sorted(registry.leases_dir().glob("gateway-*.json")):
+        try:
+            lease = json.loads(lease_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        gw_port = int(lease.get("gateway_port", 0))
+        gw_pid = int(lease.get("gateway_pid", 0))
+        if gw_port and gw_pid and registry.pid_alive(gw_pid):
+            # The chain's hivemind port: match service entries to this
+            # gateway via the lease's own identity list (the entry's
+            # owner_port names the gateway that spawned it).
+            lease_ids = set(lease.get("identities") or [])
+            hive_port = 0
+            for entry in registry.list_service_entries():
+                if entry.get("name") != "hivemind":
+                    continue
+                if (
+                    entry.get("identity") in lease_ids
+                    or entry.get("owner_port") == gw_port
+                ):
+                    try:
+                        hive_port = max(hive_port, int(entry.get("port", 0)))
+                    except (TypeError, ValueError):
+                        pass
+            rows.append((gw_port, hive_port, lease.get("config_path", "?")))
+
+    if not rows:
+        typer.echo("No live manifold gateways (leases in ~/.manifold/run/leases).")
+        return
+
+    typer.echo(f"{len(rows)} live gateway(s):")
+    for gw_port, hive_port, config in rows:
+        typer.echo(f"  gateway :{gw_port}  ({config})")
+        if hive_port:
+            typer.echo(f"    telemetry: http://localhost:{hive_port}/_telemetry")
+            typer.echo(f"    stats:     http://localhost:{gw_port}/_manifold/stats")
+
+
 @app.command()
 def status(
     config: str = typer.Option(None, "--config", "-c", help="Path to manifold.yaml"),
