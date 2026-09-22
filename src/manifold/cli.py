@@ -903,6 +903,11 @@ def gateways() -> None:
             for entry in registry.list_service_entries():
                 if entry.get("name") != "hivemind":
                     continue
+                # Liveness first: a STALE entry (dead pid, higher port) from
+                # a previous generation won the max() fold and shadowed the
+                # live hivemind (round-ten finding).
+                if not registry.entry_is_live(entry):
+                    continue
                 if (
                     entry.get("identity") in lease_ids
                     or entry.get("owner_port") == gw_port
