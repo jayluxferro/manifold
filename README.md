@@ -234,6 +234,16 @@ variant of the main chain) cannot share processes, and `up` fails preflight with
   delta-offset the second chain to collision-free ports (the pre-registry
   behavior; e.g. `--port 23456` offsets services by +14456).
 
+**Recommended port convention.** Treat the gateway port as *per-run* (`--port`,
+any free number) and give each config a **disjoint service-port block**. The
+repo's configs step the base block (`7787–7793`, `8765`) by `+100` per config
+(`+100` → `7887–7893`/`8865`, `+200` → `7987–7993`/`8965`, …), but any disjoint
+numbers work — the only rule is that no two configs' service ports overlap and
+none overlap your gateway ports. `manifold validate` enforces this statically:
+it scans sibling `manifold*.yaml` files and fails loudly when two configs
+declare overlapping service ports, so this class of collision is caught before
+anything starts rather than at `up` time.
+
 **`manifold down`** — accepts `--port <port>` (teardown a specific gateway
 port; needed when multiple instances run), `--all` (teardown every discovered
 instance), and `--config <path>` (feeds the legacy lsof fallback for

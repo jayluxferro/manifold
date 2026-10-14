@@ -5,7 +5,11 @@ from pathlib import Path
 
 import pytest
 
-from manifold.config import ConfigError, load_config
+from manifold.config import (
+    ConfigError,
+    check_cross_config_port_collisions,
+    load_config,
+)
 from manifold.models import UpstreamVia
 
 
@@ -345,3 +349,51 @@ def test_validation_covers_disabled_services(tmp_path: Path):
     p.write_text(content)
     with pytest.raises(ConfigError, match=r"\{broken\}"):
         load_config(p)
+
+
+def test_cross_config_no_siblings(config_file: Path):
+    cfg = load_config(config_file)
+    assert check_cross_config_port_collisions(config_file, cfg.pipeline) == []
+
+
+def test_cross_config_detects_overlap(config_file: Path):
+    sibling = config_file.parent / "manifold-other.yaml"
+    sibling.write_text(
+        textwrap.dedent("""\
+            pipeline:
+              - name: other
+                directory: /tmp
+                command: "echo"
+                port: 7001
+                health: /h
+                upstream_via: cli_arg
+        """)
+    )
+    cfg = load_config(config_file)
+    errors = check_cross_config_port_collisions(config_file, cfg.pipeline)
+    assert len(errors) == 1
+    assert "7001" in errors[0]
+    assert "manifold-other.yaml" in errors[0]
+
+
+def test_cross_config_disjoint_is_ok(config_file: Path):
+    sibling = config_file.parent / "manifold-other.yaml"
+    sibling.write_text(
+        textwrap.dedent("""\
+            pipeline:
+              - name: other
+                directory: /tmp
+                command: "echo"
+                port: 7999
+                health: /h
+                upstream_via: cli_arg
+        """)
+    )
+    cfg = load_config(config_file)
+    assert check_cross_config_port_collisions(config_file, cfg.pipeline) == []
+
+
+def test_cross_config_skips_corrupt_sibling(config_file: Path):
+    (config_file.parent / "manifold-broken.yaml").write_text("pipeline: [unbalanced")
+    cfg = load_config(config_file)
+    assert check_cross_config_port_collisions(config_file, cfg.pipeline) == []

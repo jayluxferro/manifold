@@ -26,7 +26,12 @@ from manifold.chain import (
     resolve_command,
     rewire_around,
 )
-from manifold.config import ConfigError, find_config, load_config
+from manifold.config import (
+    ConfigError,
+    check_cross_config_port_collisions,
+    find_config,
+    load_config,
+)
 from manifold.gateway import create_app
 from manifold.logs import ServiceColorFormatter, console_supports_color
 from manifold.health import (
@@ -988,11 +993,28 @@ def validate(
 ) -> None:
     """Validate the configuration file."""
     try:
-        cfg = load_config(config)
-        typer.echo(f"Valid: {len(cfg.pipeline)} services configured")
+        config_path = find_config(config)
+        cfg = load_config(config_path)
     except ConfigError as exc:
         typer.echo(f"Invalid: {exc}", err=True)
         raise typer.Exit(1)
+
+    collisions = check_cross_config_port_collisions(config_path, cfg.pipeline)
+    if collisions:
+        typer.echo(
+            f"Invalid: {len(collisions)} cross-config service-port overlap(s):",
+            err=True,
+        )
+        for msg in collisions:
+            typer.echo(f"  - {msg}", err=True)
+        typer.echo(
+            "Give each config its own disjoint service-port block "
+            "(see README → 'Multiple configs on one machine').",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    typer.echo(f"Valid: {len(cfg.pipeline)} services configured")
 
 
 def _discover_instances() -> list[tuple[int, Path, Path]]:

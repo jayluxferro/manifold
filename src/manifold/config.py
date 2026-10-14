@@ -181,3 +181,54 @@ def load_config(path: str | Path | None = None) -> ManifoldConfig:
             )
 
     return ManifoldConfig(gateway=gateway, pipeline=services)
+
+
+def check_cross_config_port_collisions(
+    config_path: Path, services: list[ServiceConfig]
+) -> list[str]:
+    """Detect service-port overlap with sibling manifold configs.
+
+    Two configs can coexist in shared mode only when their service ports are
+    disjoint (different wiring on the same port is a hard collision at ``up``
+    time, caught only once the second chain actually starts).  This is the
+    early, static check: it scans the config file's directory for
+    ``manifold*.yaml`` / ``manifold*.yml`` siblings and reports any service
+    port that collides with *services*.  Best-effort — unreadable or malformed
+    siblings are skipped, never a hard failure.
+    """
+    errors: list[str] = []
+    ours = {svc.port: svc.name for svc in services}
+    try:
+        self_resolved = config_path.resolve()
+    except OSError:
+        return errors
+
+    seen: set[Path] = set()
+    for pattern in ("manifold*.yaml", "manifold*.yml"):
+        for sibling in sorted(config_path.parent.glob(pattern)):
+            try:
+                resolved = sibling.resolve()
+            except OSError:
+                continue
+            if resolved == self_resolved or resolved in seen:
+                continue
+            seen.add(resolved)
+            try:
+                raw = yaml.safe_load(sibling.read_text())
+            except (OSError, UnicodeDecodeError, yaml.YAMLError):
+                continue
+            if not isinstance(raw, dict):
+                continue
+            for entry in raw.get("pipeline") or []:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    port = int(entry.get("port"))
+                except (TypeError, ValueError):
+                    continue
+                if port in ours:
+                    errors.append(
+                        f"Service port {port} ('{ours[port]}') overlaps with "
+                        f"'{entry.get('name') or '?'}' in {sibling.name}"
+                    )
+    return errors
